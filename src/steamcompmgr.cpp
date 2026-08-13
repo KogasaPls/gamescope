@@ -3411,8 +3411,8 @@ paint_all( global_focus_t *pFocus, bool async )
 			drmCaptureFormat != DRM_FORMAT_NV12 &&
 			pFocus->focusWindow != nullptr;
 
-		const uint32_t uScreenshotWidth = bRenderSizeScreenshot ? g_nNestedWidth : g_nOutputWidth;
-		const uint32_t uScreenshotHeight = bRenderSizeScreenshot ? g_nNestedHeight : g_nOutputHeight;
+		const uint32_t uScreenshotWidth = bRenderSizeScreenshot ? uint32_t( g_nNestedWidth ) : uint32_t( g_nOutputWidth );
+		const uint32_t uScreenshotHeight = bRenderSizeScreenshot ? uint32_t( g_nNestedHeight ) : uint32_t( g_nOutputHeight );
 
 		gamescope::Rc<CVulkanTexture> pScreenshotTexture;
 		if ( drmCaptureFormat != DRM_FORMAT_INVALID )
@@ -6623,7 +6623,7 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 {
 	bool bSendCallback = true;
 
-	int nRefreshHz = gamescope::ConvertmHzToHz( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh );
+	int nRefreshHz = gamescope::ConvertmHzToHz( g_nNestedRefresh ? int( g_nNestedRefresh ) : int( g_nOutputRefresh ) );
 	int nTargetFPS = g_nSteamCompMgrTargetFPS;
 
 	if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
@@ -10159,7 +10159,7 @@ steamcompmgr_main(int argc, char **argv)
 		{
 			vblank_idx++;
 
-			int nRealRefreshmHz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+			int nRealRefreshmHz = g_nNestedRefresh ? int( g_nNestedRefresh ) : int( g_nOutputRefresh );
 			g_SteamCompMgrAppRefreshCycle = gamescope::mHzToRefreshCycle( nRealRefreshmHz );
 			g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle;
 			if ( g_nSteamCompMgrTargetFPS )

@@ -301,10 +301,10 @@ int g_nNestedRefresh = 0;
 int g_nNestedUnfocusedRefresh = 0;
 int g_nNestedDisplayIndex = 0;
 
-uint32_t g_nOutputWidth = 0;
-uint32_t g_nOutputHeight = 0;
-int g_nOutputRefresh = 0;
-bool g_bOutputHDREnabled = false;
+std::atomic< uint32_t > g_nOutputWidth = { 0 };
+std::atomic< uint32_t > g_nOutputHeight = { 0 };
+std::atomic< int > g_nOutputRefresh = 0;
+std::atomic< bool > g_bOutputHDREnabled = { false };
 
 bool g_bFullscreen = false;
 bool g_bForceRelativeMouse = false;
