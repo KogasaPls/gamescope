@@ -106,7 +106,6 @@ src = [
   'convar.cpp',
   'convar_script.cpp',
   'commit.cpp',
-  'color_helpers.cpp',
   'main.cpp',
   'edid.cpp',
   'wlserver.cpp',
@@ -178,6 +177,39 @@ vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
 vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
 version_tag = vcs_tag + ' (' + compiler_name + ' ' + compiler_version + ')'
 
+# color_helpers.cpp is the one translation unit that wants fast math: the
+# colour-management LUT builders (calcColorTransform and friends). Give it the
+# flag per-file rather than wrapping the code in
+# `#pragma GCC optimize("-ffast-math")`. The pragma gives every function inside
+# the region a different optimization node from its callers, and GCC's inliner
+# will not cross that boundary ("optimization level attribute mismatch"), which
+# costs far more than fast math wins.
+#
+# -fno-lto is deliberate and load-bearing. Fast math is an Optimization flag, so
+# under LTO the mismatch between this TU's nodes and every other TU's reappears
+# at the IPA stage and eats most of the win back. Compiling this one TU without
+# LTO keeps its intra-TU optimisation intact; nothing here is on a per-frame
+# path (the LUT rebuild is dirty-checked and only runs on a colour-management
+# change), so losing cross-TU inlining for it costs nothing measurable.
+#
+# One full colour-management LUT rebuild, SDR/HDR output, znver5 -O3 -flto=auto,
+# GCC 16.1.1, medians of 150 warmed iterations:
+#
+#     upstream, global -ffast-math                 0.897 / 0.596 ms
+#     no fast math anywhere                        1.269 / 0.836 ms
+#     PR 1494 as written (pragma)                  1.905 / 1.433 ms
+#     this TU -ffast-math, still in LTO            1.264 / 1.026 ms
+#     this TU -ffast-math -fno-lto  (what we do)   1.026 / 0.624 ms
+color_helpers_lib = static_library(
+  'color_helpers',
+  'color_helpers.cpp',
+  dependencies: [glm_dep],
+  # gamescope_cpp_args carries the HAVE_* feature defines; without it a future
+  # #if HAVE_DRM (etc.) in color_helpers would silently compile the wrong
+  # branch here while every other TU sees the right one.
+  cpp_args: gamescope_cpp_args + ['-ffast-math', '-fno-lto'],
+)
+
 gamescope_version_conf = configuration_data()
 gamescope_version_conf.set('VCS_TAG', version_tag)
 
@@ -199,6 +231,7 @@ gamescope_version = configure_file(
       stb_dep, displayinfo_dep, openvr_dep, dep_xcursor, avif_dep, dep_xi,
       libdecor_dep, eis_dep, luajit_dep, libinput_dep, pixman_dep, udev_dep,
     ],
+    link_with: color_helpers_lib,
     install: true,
     cpp_args: gamescope_cpp_args,
   )
@@ -218,9 +251,9 @@ endif
 executable('gamescopereaper', ['Apps/gamescopereaper.cpp', gamescope_core_src], gamescope_version, dependencies: [cap_dep], install:true )
 
 benchmark_dep = dependency('benchmark', required: get_option('benchmark'), disabler: true)
-executable('gamescope_color_microbench', ['color_bench.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[benchmark_dep, glm_dep, cap_dep])
+executable('gamescope_color_microbench', ['color_bench.cpp'], gamescope_core_src, gamescope_version, link_with: color_helpers_lib, dependencies:[benchmark_dep, glm_dep, cap_dep])
 
-executable('gamescope_color_tests', ['color_tests.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[glm_dep, cap_dep])
+executable('gamescope_color_tests', ['color_tests.cpp'], gamescope_core_src, gamescope_version, link_with: color_helpers_lib, dependencies:[glm_dep, cap_dep])
 
 executable('gamescopectl', ['Apps/gamescopectl.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
 
