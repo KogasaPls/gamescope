@@ -727,6 +727,8 @@ extern char **environ;
 
 int main(int argc, char **argv)
 {
+	signal( SIGPIPE, SIG_IGN );
+
 	g_argc = argc;
 	g_argv = argv;
 
