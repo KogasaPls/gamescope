@@ -3100,11 +3100,13 @@ gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay
 gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
 gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
 
-static void
+// False when the frame was not presented and its damage is still pending, so
+// the caller must keep the repaint flags set.
+static bool
 paint_all( global_focus_t *pFocus, bool async )
 {
 	if ( !pFocus )
-		return;
+		return false;
 
 	gamescope::IBackendConnector *pConnector = pFocus->pVirtualConnector.get();
 	if ( !pConnector )
@@ -3383,7 +3385,7 @@ paint_all( global_focus_t *pFocus, bool async )
 
 	if ( !bValidContents || GetBackend()->IsPaused() )
 	{
-		return;
+		return true;
 	}
 
 	unsigned int blurFadeTime = get_time_in_milliseconds() - g_BlurFadeStartTime;
@@ -3503,7 +3505,7 @@ paint_all( global_focus_t *pFocus, bool async )
 
 	if ( pConnector && pConnector->Present( &frameInfo, async ) != 0 )
 	{
-		return;
+		return false;
 	}
 
 	std::optional<gamescope::GamescopeScreenshotInfo> oScreenshotInfo =
@@ -3661,7 +3663,7 @@ paint_all( global_focus_t *pFocus, bool async )
 			if ( !oScreenshotSeq )
 			{
 				xwm_log.errorf("vulkan_screenshot failed");
-				return;
+				return true;
 			}
 
 			vulkan_wait( *oScreenshotSeq, false );
@@ -3898,6 +3900,8 @@ paint_all( global_focus_t *pFocus, bool async )
 
 	gpuvis_trace_end_ctx_printf( paintID, "paint_all" );
 	gpuvis_trace_printf( "paint_all %i layers", (int)frameInfo.layers.count() );
+
+	return true;
 }
 
 /* Get prop from window
@@ -8238,6 +8242,11 @@ void force_repaint( void )
 	nudge_steamcompmgr();
 }
 
+void force_repaint_on_vblank( void )
+{
+	g_bForceRepaint = true;
+}
+
 static void ClearUpscaleImages( global_focus_t *pFocus )
 {
 	pFocus->UpscaleImages.clear();
@@ -10257,6 +10266,10 @@ steamcompmgr_main(int argc, char **argv)
 		// Pick our width/height for this potential frame, regardless of how it might change later
 		// At some point we might even add proper locking so we get real updates atomically instead
 		// of whatever jumble of races the below might cause over a couple of frames
+		static uint32_t currentOutputRingDepth = 0;
+		const uint32_t uOutputRingDepth = GetBackend()->GetOutputRingDepth();
+		const bool bRingDepthChanged = currentOutputRingDepth != uOutputRingDepth;
+
 		const bool bHDROutputChanged = currentHDROutput != g_bOutputHDREnabled;
 
 		// The HDR flag only feeds the swapchain format; the output images on
@@ -10330,6 +10343,16 @@ steamcompmgr_main(int argc, char **argv)
 #if HAVE_PIPEWIRE
 			nudge_pipewire();
 #endif
+		}
+
+		if ( bRingDepthChanged )
+		{
+			if ( !bReconfigureOutput && !GetBackend()->UsesVulkanSwapchain() )
+			{
+				vulkan_remake_output_images();
+				hasRepaint = true;
+			}
+			currentOutputRingDepth = uOutputRingDepth;
 		}
 
 		// Ask for a new surface every vblank
@@ -10679,9 +10702,10 @@ steamcompmgr_main(int argc, char **argv)
 
 			if ( bShouldPaint )
 			{
-				paint_all( pPaintFocus, eFlipType == FlipType::Async );
-
-				bPainted = true;
+				// The repaint flags below are global, so this is "did any
+				// connector present without dropping": one that dropped its
+				// frame recovers through force_repaint_on_vblank instead.
+				bPainted |= paint_all( pPaintFocus, eFlipType == FlipType::Async );
 			}
 		}
 
