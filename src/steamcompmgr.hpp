@@ -140,6 +140,9 @@ extern uint64_t g_lastWinSeq;
 void nudge_steamcompmgr( void );
 void MakeFocusDirty();
 void force_repaint( void );
+// Same, without waking the main loop: for a caller inside a paint that is being
+// dropped, where waking again immediately spins against whatever made it fail.
+void force_repaint_on_vblank( void );
 
 // Per-connector stat snapshot for typed mangoapp streams.
 struct MangoappSnapshot_t
