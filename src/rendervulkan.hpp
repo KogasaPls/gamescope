@@ -461,6 +461,13 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr );
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
+
+// Points the ring cursor at a slot the consumer does not hold, preferring the
+// current one. Returns false when every slot is held.
+//
+// The allocation, the post-composite advance and the last-output lookbacks all
+// read the depth from VulkanOutput_t::uRingSize, so they agree on one number.
+bool vulkan_output_ring_rotate_to_free_slot( void );
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 uint32_t vulkan_get_rgb10_capture_format( void );
@@ -584,6 +591,16 @@ struct VulkanOutput_t
 	VkFence acquireFence;
 
 	uint32_t nOutImage; // swapchain index in nested mode, or ping/pong between two RTs
+	// Number of slots the ring cursor cycles through. Set by
+	// vulkan_make_output_images() to match how many output images actually
+	// exist; left at the historical three for the Vulkan swapchain path, which
+	// drives nOutImage from AcquireNextImageKHR instead of cycling it.
+	uint32_t uRingSize = 3;
+	// Slots actually composited into, most recent first. Derived indices
+	// (cursor-1 / cursor-2) are only correct while the cursor advances by
+	// exactly one per composite, which stopped being true when the output ring
+	// gate gained the right to rotate it onto a free slot.
+	uint32_t uLastComposited[2] = { 0, 0 };
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImages;
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImagesPartialOverlay;
 	gamescope::OwningRc<CVulkanTexture> temporaryHackyBlankImage;
