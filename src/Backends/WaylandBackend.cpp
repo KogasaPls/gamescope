@@ -124,6 +124,9 @@ namespace gamescope
 
     gamescope::ConVar<float> cv_wayland_hdr10_saturation_scale( "wayland_hdr10_saturation_scale", 1.0, "Saturation scale for HDR10 content by gamut expansion. 1.0 - 1.2 is a good range to play with." );
 
+    gamescope::ConVar<bool> cv_wayland_output_ring_backpressure( "wayland_output_ring_backpressure", true,
+        "Keep displaying the previous frame while the host holds every output ring slot. Disabling this permits overwriting a held buffer." );
+
     class CWaylandConnector;
     class CWaylandPlane;
     class CWaylandBackend;
@@ -557,6 +560,11 @@ namespace gamescope
         void OnCompositorAcquire();
         void OnCompositorRelease();
 
+        // wl_buffer.release arrives once, on the buffer's last unlock, and a
+        // commit that attaches it again locks it before the old lock drops,
+        // so the flag stays exact for a buffer re-attached while held.
+        virtual bool IsHeldByCompositor() const override { return m_bCompositorAcquired; }
+
         wl_buffer *GetHostBuffer() const { return m_pHostBuffer; }
         wlr_buffer *GetClientBuffer() const { return m_pClientBuffer; }
 
@@ -746,6 +754,11 @@ namespace gamescope
         virtual void DirtyState( bool bForce = false, bool bForceModeset = false ) override;
         virtual bool PollState() override;
 
+        virtual uint32_t GetOutputRingDepth() const override
+        {
+            return std::min( 1u + 3u * std::max( 1u, m_uConnectorCount.load() ), 31u );
+        }
+
         virtual std::shared_ptr<BackendBlob> CreateBackendBlob( const std::type_info &type, std::span<const uint8_t> data ) override;
 
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) override;
@@ -841,10 +854,16 @@ namespace gamescope
         wl_region *GetFullRegion() const { return m_pFullRegion; }
         CWaylandFb *GetBlackFb() const { return m_BlackFb.get(); }
 
+        void OnConnectorCreated()
+        {
+            m_uConnectorCount++;
+        }
+
         void OnConnectorDestroyed( CWaylandConnector *pConnector )
         {
             CWaylandConnector *pExpected = pConnector;
             m_pFocusConnector.compare_exchange_strong( pExpected, nullptr );
+            m_uConnectorCount--;
         }
 
     private:
@@ -930,6 +949,7 @@ namespace gamescope
 
         // TODO: Restructure and remove the need for this.
         std::atomic<CWaylandConnector *> m_pFocusConnector;
+        std::atomic<uint32_t> m_uConnectorCount = { 0 };
 
         wl_data_device_manager *m_pDataDeviceManager = nullptr;
         wl_data_device *m_pDataDevice = nullptr;
@@ -1099,7 +1119,7 @@ namespace gamescope
         }
         else
         {
-            xdg_log.errorf( "Compositor released us but we were not acquired. Oh no." );
+            xdg_log.debugf( "Compositor released us but we were not acquired. Oh no." );
         }
     }
 
@@ -1127,6 +1147,7 @@ namespace gamescope
     {
         m_HDRInfo.bAlwaysPatchEdid = true;
         m_HDRInfo.bContentDrivenHDR = true;
+        m_pBackend->OnConnectorCreated();
     }
 
     CWaylandConnector::~CWaylandConnector()
@@ -1253,6 +1274,18 @@ namespace gamescope
 
     int CWaylandConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
     {
+        // Dispatch pending host events before the frame is sized, not during
+        // it: a libdecor configure changes the output size and the viewport,
+        // and everything below is laid out against one snapshot of both. A
+        // configure that lands here has already missed the loop's size latch:
+        // the composite would cover the latched size while the output images
+        // it makes on first use take the new one, so drop the frame and let the
+        // next iteration latch again.
+        m_pBackend->PollState();
+
+        if ( g_nOutputWidth != currentOutputWidth || g_nOutputHeight != currentOutputHeight )
+            return -EAGAIN;
+
         UpdateFullscreenState();
         // A hidden window keeps the viewport it had: recomputing it with no app
         // layer sizes the host window back to the whole output, and to the app
@@ -1346,6 +1379,10 @@ namespace gamescope
             }
             else
             {
+                // The host keeps displaying the previous frame until a slot is released.
+                if ( !vulkan_output_ring_rotate_to_free_slot() && cv_wayland_output_ring_backpressure )
+                    return -EAGAIN;
+
                 std::optional oCompositeResult = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false );
 
                 if ( !oCompositeResult )
@@ -1982,18 +2019,18 @@ namespace gamescope
     {
         IBackendFb *pBackendFb = pLayer && pLayer->tex != nullptr ? pLayer->tex->GetBackendFb() : nullptr;
         CWaylandFb *pWaylandFb = pBackendFb ? static_cast<CWaylandFb*>( pBackendFb->EnsureImported() ) : nullptr;
-        wl_buffer *pBuffer = pWaylandFb ? pWaylandFb->GetHostBuffer() : nullptr;
 
-        if ( pBuffer )
+        // Decide before acquiring: an acquired wl_buffer that never reaches
+        // wl_surface_attach is never released.
+        std::optional<WaylandPlaneState> oState;
+
+        if ( pWaylandFb )
         {
-            pWaylandFb->OnCompositorAcquire();
-
             const app_viewport::Rect layerRect = LayerRect( *pLayer );
 
-            Present(
-                ClipPlane( WaylandPlaneState
+            oState = ClipPlane( WaylandPlaneState
                 {
-                    .pBuffer     = pBuffer,
+                    .pBuffer     = nullptr,
                     .nDestX      = layerRect.nX,
                     .nDestY      = layerRect.nY,
                     .flSrcX      = 0.0,
@@ -2006,12 +2043,16 @@ namespace gamescope
                     .pHDRMetadata = pLayer->hdr_metadata_blob,
                     .bOpaque     = pLayer->zpos == g_zposBase,
                     .uFractionalScale = GetScale(),
-                }, viewport ) );
+                }, viewport );
+
+            if ( oState )
+            {
+                pWaylandFb->OnCompositorAcquire();
+                oState->pBuffer = pWaylandFb->GetHostBuffer();
+            }
         }
-        else
-        {
-            Present( std::nullopt );
-        }
+
+        Present( std::move( oState ) );
     }
 
     void CWaylandPlane::UpdateVRRRefreshRate()
