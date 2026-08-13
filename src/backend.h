@@ -363,6 +363,12 @@ namespace gamescope
         }
         virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) = 0;
 
+        // The size a pipewire capture should be rendered at when it differs from
+        // the output size; false otherwise. It lives here rather than on the
+        // connector because the pipewire thread reads it and a connector can be
+        // destroyed under it, while the backend cannot.
+        virtual bool GetCaptureExtent( uint32_t &uWidth, uint32_t &uHeight ) const { return false; }
+
         virtual bool SupportsPlaneHardwareCursor() const = 0;
         virtual bool SupportsTearing() const = 0;
 
