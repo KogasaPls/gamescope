@@ -13,6 +13,7 @@ namespace GamescopeLayerClient
 
         static constexpr uint32_t NoSuboptimal = 1u << 3;
         static constexpr uint32_t ForceSwapchainExtent = 1u << 4;
+        static constexpr uint32_t PresentModePassthrough = 1u << 5;
     }
     using Flags = uint32_t;
 }
