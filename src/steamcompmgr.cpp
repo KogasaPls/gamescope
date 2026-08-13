@@ -6674,9 +6674,12 @@ steamcompmgr_latch_frame_done( steamcompmgr_win_t *w, uint64_t vblank_idx, uint6
 	}
 }
 
+// __FINITE_MATH_ONLY__ is defined unconditionally (0 normally, 1 under fast
+// math), so the guard must test its value -- see the note on ClampAndSanitize
+// in color_helpers.cpp.
 static inline float santitize_float( float f )
 {
-#ifndef __FAST_MATH__
+#if !( defined(__FAST_MATH__) || ( defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__ > 0 ) )
 	return ( std::isfinite( f ) ? f : 0.f );
 #else
 	return f;
