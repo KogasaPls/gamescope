@@ -294,6 +294,17 @@ namespace gamescope
             }
 		}
 
+        virtual bool GetCaptureExtent( uint32_t &uWidth, uint32_t &uHeight ) const override
+        {
+            {
+                std::shared_lock lock{ m_mutInit };
+                if ( m_bInittedChild )
+                    return m_pChild->GetCaptureExtent( uWidth, uHeight );
+            }
+
+            return false;
+        }
+
         virtual bool NeedsFrameSync() const override
         {
             // Deferred backends do not support frame sync.
