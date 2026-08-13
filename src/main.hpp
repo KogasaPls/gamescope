@@ -28,6 +28,7 @@ extern uint32_t g_uOutputRotation;
 extern bool g_bFullscreen;
 
 extern bool g_bGrabbed;
+extern bool g_bTrackAppSize;
 
 extern float g_mouseSensitivity;
 extern const char *g_sOutputName;
