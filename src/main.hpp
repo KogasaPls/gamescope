@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "gamescope_shared.h"
+#include "Utils/AtomicValue.h"
 
 extern const char *gamescope_optstring;
 extern const struct option *gamescope_options;
@@ -20,11 +21,31 @@ extern int g_nNestedRefresh; // mHz
 extern int g_nNestedUnfocusedRefresh; // mHz
 extern int g_nNestedDisplayIndex;
 
-extern uint32_t g_nOutputWidth;
-extern uint32_t g_nOutputHeight;
+// The output size is written by one thread, the one that owns the backend's
+// size paths, and read by several: the Wayland input thread's pointer and touch
+// normalisation, wlserver, the pipewire capture thread, and mangoapp. Plain uint32_t globals made every one of those reads a
+// data race, so the compiler was free to hoist or duplicate them -- undefined
+// behaviour, not merely a stale value.
+//
+// AtomicValue removes that. Its implicit load and store conversions keep every
+// existing use site compiling unchanged, conditional expressions included, and
+// on x86-64 a seq_cst load is a plain mov; only the stores take a fence, and
+// those happen on a mode set or a window resize, not per frame.
+//
+// The two are individually atomic, NOT jointly. A reader can still see a new
+// width against an old height for one event, which costs at worst one
+// mispositioned pointer event or one capture frame sized from a mismatched
+// pair, both self-correcting on the next one. A consumer that needs the pair as
+// one value has to carry it as one value; no global here does.
+extern gamescope::AtomicValue< uint32_t > g_nOutputWidth;
+extern gamescope::AtomicValue< uint32_t > g_nOutputHeight;
 extern bool g_bForceRelativeMouse;
-extern int g_nOutputRefresh; // mHz
-extern bool g_bOutputHDREnabled;
+extern gamescope::AtomicValue< int > g_nOutputRefresh; // mHz
+// Atomic for the same reason as the output size above: it is read
+// cross-thread (e.g. the OpenVR backend's input thread), and tying it to app
+// content turned it from write-once-at-startup into a write every few
+// hundred milliseconds on the steamcompmgr thread.
+extern gamescope::AtomicValue< bool > g_bOutputHDREnabled;
 extern bool g_bForceInternal;
 
 extern bool g_bForceCompositionRotation;
