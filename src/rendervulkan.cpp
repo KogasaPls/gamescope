@@ -184,15 +184,15 @@ struct wsi_image_create_info {
 	VkStructureType sType;
 	const void *pNext;
 	bool scanout;
-
-	uint32_t modifier_count;
-	const uint64_t *modifiers;
+	bool blit_src;
 };
 
 struct wsi_memory_allocate_info {
     VkStructureType sType;
     const void *pNext;
     bool implicit_sync;
+    bool dma_buf_sync_file;
+    bool reserved[6]; // To avoid issues down the line.
 };
 
 // DRM doesn't always have 32bit floating point formats, so add our own if necessary
