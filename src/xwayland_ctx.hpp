@@ -2,6 +2,10 @@
 
 #include "backend.h"
 #include "waitable.h"
+#include "wayland_selection_helpers.hpp"
+
+#include <array>
+#include <atomic>
 
 #include <mutex>
 #include <memory>
@@ -269,10 +273,32 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom clipboard;
 		Atom primarySelection;
 		Atom targets;
+		Atom timestamp;
+		// The MIME types of wayland_selection::k_SupportedMimeTypes, interned
+		// in that order, as the selection targets we serve them under.
+		std::array<Atom, gamescope::wayland_selection::k_SupportedMimeTypes.size()> selectionMimeTypes;
 
 		Atom wm_protocols;
 		Atom wm_delete_window;
 	} atoms;
+
+	// Protected by g_SelectionMutex. Each mirror has its own X window so
+	// destroying it can only release the selection we acquired.
+	struct {
+		Window window = None;
+		Time time = CurrentTime;
+	} selectionMirrors[GAMESCOPE_SELECTION_COUNT];
+
+	// Steamcompmgr thread only. Refusals carry no property. The requestor
+	// window identifies even those replies when ownership changes twice in
+	// one X server millisecond.
+	struct {
+		Window owner = None;
+		Window requestor = None;
+		uint64_t generation = 0;
+		bool accepted = false;
+	} selectionImports[GAMESCOPE_SELECTION_COUNT];
+	std::vector<Window> retiredSelectionRequestors;
 
 	bool HasQueuedEvents();
 

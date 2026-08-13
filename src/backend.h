@@ -279,6 +279,9 @@ namespace gamescope
         virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) = 0;
         virtual void SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection ) = 0;
 
+        // Withdraw only a selection this backend published for a nested owner.
+        virtual void RevokeSelection( GamescopeSelection eSelection ) {}
+
         virtual bool ShouldPaintCursor() { return false; }
     };
 
