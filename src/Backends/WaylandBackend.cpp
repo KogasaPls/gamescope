@@ -6,6 +6,7 @@
 #include "edid.h"
 #include "Utils/Defer.h"
 #include "Utils/Algorithm.h"
+#include "app_viewport_helpers.hpp"
 #include "convar.h"
 #include "refresh_rate.h"
 #include "waitable.h"
@@ -137,6 +138,8 @@ namespace gamescope
         wl_buffer *pBuffer;
         int32_t nDestX;
         int32_t nDestY;
+        int32_t nOutputX;
+        int32_t nOutputY;
         double flSrcX;
         double flSrcY;
         double flSrcWidth;
@@ -149,24 +152,44 @@ namespace gamescope
         uint32_t uFractionalScale;
     };
 
-    inline std::optional<WaylandPlaneState> ClipPlane( const WaylandPlaneState &state )
-    {
-        int32_t nClippedDstWidth  = std::min<int32_t>( g_nOutputWidth,  state.nDstWidth  + state.nDestX ) - state.nDestX;
-        int32_t nClippedDstHeight = std::min<int32_t>( g_nOutputHeight, state.nDstHeight + state.nDestY ) - state.nDestY;
+    gamescope::ConVar<bool> cv_track_app_size_debug( "track_app_size_debug", false, "Log --track-app-size viewport changes." );
 
-        // A plane that starts past the edge of the output clips away to nothing.
+    static constexpr uint32_t k_uHostDictatedWindowStates =
+        LIBDECOR_WINDOW_STATE_MAXIMIZED | LIBDECOR_WINDOW_STATE_FULLSCREEN |
+        LIBDECOR_WINDOW_STATE_TILED_LEFT | LIBDECOR_WINDOW_STATE_TILED_RIGHT |
+        LIBDECOR_WINDOW_STATE_TILED_TOP | LIBDECOR_WINDOW_STATE_TILED_BOTTOM;
+
+    inline std::optional<WaylandPlaneState> ClipPlane( const WaylandPlaneState &state, const app_viewport::Rect &viewport )
+    {
+        const std::optional<app_viewport::PlaneRect> oClipped = app_viewport::ClipPlaneToViewport(
+            app_viewport::PlaneRect
+            {
+                .nDestX      = state.nDestX,
+                .nDestY      = state.nDestY,
+                .flSrcX      = state.flSrcX,
+                .flSrcY      = state.flSrcY,
+                .flSrcWidth  = state.flSrcWidth,
+                .flSrcHeight = state.flSrcHeight,
+                .nDstWidth   = state.nDstWidth,
+                .nDstHeight  = state.nDstHeight,
+            },
+            viewport );
+
         // Viewport source and destination sizes must be positive, so present no buffer at all.
-        if ( nClippedDstWidth <= 0 || nClippedDstHeight <= 0 )
+        if ( !oClipped )
             return std::nullopt;
 
-        double flClippedSrcWidth  = state.flSrcWidth  * ( nClippedDstWidth  / double( state.nDstWidth ) );
-        double flClippedSrcHeight = state.flSrcHeight * ( nClippedDstHeight / double( state.nDstHeight ) );
-
         WaylandPlaneState outState = state;
-        outState.nDstWidth   = nClippedDstWidth;
-        outState.nDstHeight  = nClippedDstHeight;
-        outState.flSrcWidth  = flClippedSrcWidth;
-        outState.flSrcHeight = flClippedSrcHeight;
+        outState.nDestX      = oClipped->nDestX;
+        outState.nDestY      = oClipped->nDestY;
+        outState.nOutputX    = oClipped->nDestX + viewport.nX;
+        outState.nOutputY    = oClipped->nDestY + viewport.nY;
+        outState.flSrcX      = oClipped->flSrcX;
+        outState.flSrcY      = oClipped->flSrcY;
+        outState.flSrcWidth  = oClipped->flSrcWidth;
+        outState.flSrcHeight = oClipped->flSrcHeight;
+        outState.nDstWidth   = oClipped->nDstWidth;
+        outState.nDstHeight  = oClipped->nDstHeight;
         return outState;
     }
 
@@ -219,13 +242,15 @@ namespace gamescope
         uint32_t GetScale() const;
 
         void Present( std::optional<WaylandPlaneState> oState );
-        void Present( const FrameInfo_t::Layer_t *pLayer );
+        void Present( const FrameInfo_t::Layer_t *pLayer, const app_viewport::Rect &viewport );
 
         void CommitLibDecor( libdecor_configuration *pConfiguration );
         void Commit();
 
         wl_surface *GetSurface() const { return m_pSurface; }
         libdecor_frame *GetFrame() const { return m_pFrame; }
+        libdecor_window_state GetWindowState() const { return m_eWindowState; }
+        void SetNeedsDecorCommit() { m_bNeedsDecorCommit = true; }
         xdg_toplevel *GetXdgToplevel() const;
 
         std::optional<WaylandPlaneState> GetCurrentState() { std::unique_lock lock( m_PlaneStateLock ); return m_oCurrentPlaneState; }
@@ -412,6 +437,17 @@ namespace gamescope
         void SetFullscreen( bool bFullscreen ); // Thread safe, can be called from the input thread.
         void UpdateFullscreenState();
 
+        // libdecor's first configure arrives during init, before any Present
+        // has run UpdateViewport, so m_Viewport is still the zero rect there.
+        app_viewport::Rect GetViewport() const
+        {
+            const app_viewport::Rect output{ 0, 0, uint32_t( g_nOutputWidth ), uint32_t( g_nOutputHeight ) };
+            if ( !m_Viewport.IsValid() || ( m_Planes[0].GetWindowState() & k_uHostDictatedWindowStates ) )
+                return output;
+            return m_Viewport;
+        }
+        bool IsCroppingOutput() const { return m_bCroppingOutput; }
+        std::optional<app_viewport::Rect> OnHostConfigure( bool bHostDictated, uint32_t uConfiguredWidth, uint32_t uConfiguredHeight );
 
         bool HostCompositorIsCurrentlyVRR() const { return m_bHostCompositorIsCurrentlyVRR; }
         void SetHostCompositorIsCurrentlyVRR( bool bActive ) { m_bHostCompositorIsCurrentlyVRR = bActive; }
@@ -487,6 +523,13 @@ namespace gamescope
         std::atomic<bool> m_bDesiredFullscreenState = { false };
 
         bool m_bHostCompositorIsCurrentlyVRR = false;
+
+        void UpdateViewport( const FrameInfo_t *pFrameInfo );
+        app_viewport::Rect m_Viewport;
+        bool m_bCroppingOutput = false;
+        bool m_bHostDictated = false;
+        app_viewport::Rect m_FloatingOutput;
+        app_viewport::Rect m_FloatingViewport;
     };
 
     class CWaylandFb final : public CBaseBackendFb
@@ -674,6 +717,14 @@ namespace gamescope
         virtual IBackendConnector *GetCurrentConnector() override;
         virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) override;
 
+        virtual bool GetCaptureExtent( uint32_t &uWidth, uint32_t &uHeight ) const override
+        {
+            // Read from the pipewire thread; the pair may tear for one frame, which the stream renegotiates.
+            uWidth = m_uCaptureWidth.load();
+            uHeight = m_uCaptureHeight.load();
+            return uWidth != 0 && uHeight != 0;
+        }
+
         virtual bool SupportsPlaneHardwareCursor() const override;
 
         virtual bool SupportsTearing() const override;
@@ -740,9 +791,19 @@ namespace gamescope
         wl_region *GetFullRegion() const { return m_pFullRegion; }
         CWaylandFb *GetBlackFb() const { return m_BlackFb.get(); }
 
+        void SetCaptureExtent( uint32_t uWidth, uint32_t uHeight )
+        {
+            m_uCaptureWidth.store( uWidth );
+            m_uCaptureHeight.store( uHeight );
+        }
+
         void OnConnectorDestroyed( CWaylandConnector *pConnector )
         {
-            m_pFocusConnector.compare_exchange_strong( pConnector, nullptr );
+            CWaylandConnector *pExpected = pConnector;
+            m_pFocusConnector.compare_exchange_strong( pExpected, nullptr );
+
+            if ( pConnector->IsCroppingOutput() )
+                SetCaptureExtent( 0, 0 );
         }
 
     private:
@@ -815,6 +876,9 @@ namespace gamescope
 
         // TODO: Restructure and remove the need for this.
         std::atomic<CWaylandConnector *> m_pFocusConnector;
+
+        std::atomic<uint32_t> m_uCaptureWidth = { 0 };
+        std::atomic<uint32_t> m_uCaptureHeight = { 0 };
 
         wl_data_device_manager *m_pDataDeviceManager = nullptr;
         wl_data_device *m_pDataDevice = nullptr;
@@ -1058,9 +1122,85 @@ namespace gamescope
         }
     }
 
+    static app_viewport::Rect LayerRect( const FrameInfo_t::Layer_t &layer )
+    {
+        return app_viewport::Rect
+        {
+            int32_t( -layer.offset.x ),
+            int32_t( -layer.offset.y ),
+            uint32_t( ceil( layer.tex->width() / double( layer.scale.x ) ) ),
+            uint32_t( ceil( layer.tex->height() / double( layer.scale.y ) ) ),
+        };
+    }
+
+    void CWaylandConnector::UpdateViewport( const FrameInfo_t *pFrameInfo )
+    {
+        std::optional<app_viewport::Rect> oApp;
+        if ( g_bTrackAppSize && pFrameInfo && !( m_Planes[0].GetWindowState() & k_uHostDictatedWindowStates ) )
+        {
+            // During a fade layer 0 is the outgoing window's cached texture and
+            // layer 1 the incoming window; size to the one that stays.
+            const int nAppLayer = ( pFrameInfo->bFadingOut && pFrameInfo->layers.count() >= 2 ) ? 1 : 0;
+            if ( pFrameInfo->layers.count() > nAppLayer && pFrameInfo->layers.get( nAppLayer ).tex != nullptr )
+                oApp = LayerRect( pFrameInfo->layers.get( nAppLayer ) );
+        }
+
+        const app_viewport::Rect output{ 0, 0, g_nOutputWidth, g_nOutputHeight };
+        const app_viewport::Rect viewport = app_viewport::ComputeViewport( oApp, output.uWidth, output.uHeight );
+        // A host-dictated resize moves the output without moving the viewport,
+        // so this is settled before the unchanged-viewport early return.
+        m_bCroppingOutput = oApp.has_value() && viewport != output;
+        m_pBackend->SetCaptureExtent(
+            m_bCroppingOutput ? viewport.uWidth : 0,
+            m_bCroppingOutput ? viewport.uHeight : 0 );
+        if ( viewport == m_Viewport )
+            return;
+
+        if ( cv_track_app_size_debug )
+            xdg_log.infof( "track-app-size: viewport %d,%d %ux%u -> %d,%d %ux%u",
+                m_Viewport.nX, m_Viewport.nY, m_Viewport.uWidth, m_Viewport.uHeight,
+                viewport.nX, viewport.nY, viewport.uWidth, viewport.uHeight );
+
+        const bool bSizeChanged = viewport.uWidth != m_Viewport.uWidth || viewport.uHeight != m_Viewport.uHeight;
+        m_Viewport = viewport;
+        if ( bSizeChanged )
+            m_Planes[0].SetNeedsDecorCommit();
+    }
+
+    std::optional<app_viewport::Rect> CWaylandConnector::OnHostConfigure( bool bHostDictated, uint32_t uConfiguredWidth, uint32_t uConfiguredHeight )
+    {
+        const app_viewport::HostConfigureResult result = app_viewport::DecideHostConfigure(
+            app_viewport::HostConfigureState{ m_bHostDictated, m_FloatingOutput, m_FloatingViewport, m_Viewport },
+            app_viewport::HostConfigureInput{ bHostDictated, { 0, 0, uConfiguredWidth, uConfiguredHeight },
+                { 0, 0, uint32_t( g_nOutputWidth ), uint32_t( g_nOutputHeight ) }, g_bTrackAppSize } );
+
+        m_bHostDictated = result.state.bHostDictated;
+        m_FloatingOutput = result.state.floatingOutput;
+        m_FloatingViewport = result.state.floatingViewport;
+        m_Viewport = result.state.viewport;
+
+        if ( result.eAction == app_viewport::HostConfigureAction::RestoreFloating )
+        {
+            m_bCroppingOutput = result.bCroppingOutput;
+            m_pBackend->SetCaptureExtent(
+                m_bCroppingOutput ? m_Viewport.uWidth : 0,
+                m_bCroppingOutput ? m_Viewport.uHeight : 0 );
+        }
+
+        if ( result.eAction == app_viewport::HostConfigureAction::KeepOutput )
+            return std::nullopt;
+        return result.outputToAdopt;
+    }
+
     int CWaylandConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
     {
         UpdateFullscreenState();
+        // A hidden window keeps the viewport it had: recomputing it with no app
+        // layer sizes the host window back to the whole output, and to the app
+        // again on the next visible frame.
+        if ( m_bVisible )
+            UpdateViewport( pFrameInfo );
+        const app_viewport::Rect frameViewport = GetViewport();
 
         bool bNeedsFullComposite = false;
 
@@ -1068,7 +1208,7 @@ namespace gamescope
         {
             uint32_t uCurrentPlane = 0;
             for ( int i = 0; i < 8 && uCurrentPlane < 8; i++ )
-                m_Planes[uCurrentPlane++].Present( nullptr );
+                m_Planes[uCurrentPlane++].Present( nullptr, frameViewport );
         }
         else
         {
@@ -1104,6 +1244,11 @@ namespace gamescope
                          close_enough( pFrameInfo->layers.get( 0 ).offset.y, 0.0f ) &&
                          !pFrameInfo->layers.get( 0 ).hasAlpha() )
                         bNeedsBacking = false;
+                    if ( IsCroppingOutput() &&
+                         pFrameInfo->layers.get( 0 ).tex != nullptr &&
+                         LayerRect( pFrameInfo->layers.get( 0 ) ) == frameViewport &&
+                         !pFrameInfo->layers.get( 0 ).hasAlpha() )
+                        bNeedsBacking = false;
                 }
 
                 uint32_t uCurrentPlane = 0;
@@ -1116,10 +1261,12 @@ namespace gamescope
                         WaylandPlaneState
                         {
                             .pBuffer     = m_pBackend->GetBlackFb()->GetHostBuffer(),
+                            .nOutputX    = frameViewport.nX,
+                            .nOutputY    = frameViewport.nY,
                             .flSrcWidth  = 1.0,
                             .flSrcHeight = 1.0,
-                            .nDstWidth   = int32_t( g_nOutputWidth ),
-                            .nDstHeight  = int32_t( g_nOutputHeight ),
+                            .nDstWidth   = int32_t( frameViewport.uWidth ),
+                            .nDstHeight  = int32_t( frameViewport.uHeight ),
                             .eColorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU,
                             .bOpaque     = true,
                             .uFractionalScale = pPlane->GetScale(),
@@ -1127,7 +1274,7 @@ namespace gamescope
                 }
 
                 for ( int i = 0; i < 8 && uCurrentPlane < 8; i++ )
-                    m_Planes[uCurrentPlane++].Present( i < pFrameInfo->layers.count() ? &pFrameInfo->layers.get( i ) : nullptr );
+                    m_Planes[uCurrentPlane++].Present( i < pFrameInfo->layers.count() ? &pFrameInfo->layers.get( i ) : nullptr, frameViewport );
             }
             else
             {
@@ -1154,10 +1301,10 @@ namespace gamescope
                 compositeLayer.ctm = nullptr;
                 compositeLayer.colorspace = pFrameInfo->outputEncodingEOTF == EOTF_PQ ? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
 
-                m_Planes[0].Present( &compositeLayer );
+                m_Planes[0].Present( &compositeLayer, frameViewport );
 
                 for ( int i = 1; i < 8; i++ )
-                    m_Planes[i].Present( nullptr );
+                    m_Planes[i].Present( nullptr, frameViewport );
             }
         }
 
@@ -1673,12 +1820,18 @@ namespace gamescope
             // Fraction with denominator of 120 per. spec
             const uint32_t uScale = oState->uFractionalScale;
 
+            // The extent is the difference of the rounded edges, not the rounded
+            // difference: wl_fixed rounds halves away from zero, so rounding
+            // origin and extent apart can put their sum a 256th of a pixel past
+            // the buffer, which the host rejects as a protocol error.
+            const wl_fixed_t nSrcX = wl_fixed_from_double( oState->flSrcX );
+            const wl_fixed_t nSrcY = wl_fixed_from_double( oState->flSrcY );
             wp_viewport_set_source(
                 m_pViewport,
-                wl_fixed_from_double( oState->flSrcX ),
-                wl_fixed_from_double( oState->flSrcY ),
-                wl_fixed_from_double( oState->flSrcWidth ),
-                wl_fixed_from_double( oState->flSrcHeight ) );
+                nSrcX,
+                nSrcY,
+                wl_fixed_from_double( oState->flSrcX + oState->flSrcWidth ) - nSrcX,
+                wl_fixed_from_double( oState->flSrcY + oState->flSrcHeight ) - nSrcY );
             wp_viewport_set_destination(
                 m_pViewport,
                 WaylandScaleToLogical( oState->nDstWidth, uScale ),
@@ -1708,9 +1861,10 @@ namespace gamescope
     void CWaylandPlane::CommitLibDecor( libdecor_configuration *pConfiguration )
     {
         int32_t uScale = GetScale();
+        const app_viewport::Rect viewport = m_pConnector->GetViewport();
         libdecor_state *pState = libdecor_state_new(
-            WaylandScaleToLogical( g_nOutputWidth, uScale ),
-            WaylandScaleToLogical( g_nOutputHeight, uScale ) );
+            WaylandScaleToLogical( viewport.uWidth, uScale ),
+            WaylandScaleToLogical( viewport.uHeight, uScale ) );
         libdecor_frame_commit( m_pFrame, pState, pConfiguration );
         libdecor_state_free( pState );
     }
@@ -1734,7 +1888,7 @@ namespace gamescope
         return libdecor_frame_get_xdg_toplevel( m_pFrame );
     }
 
-    void CWaylandPlane::Present( const FrameInfo_t::Layer_t *pLayer )
+    void CWaylandPlane::Present( const FrameInfo_t::Layer_t *pLayer, const app_viewport::Rect &viewport )
     {
         CWaylandFb *pWaylandFb = pLayer && pLayer->tex != nullptr ? static_cast<CWaylandFb*>( pLayer->tex->GetBackendFb()->EnsureImported() ) : nullptr;
         wl_buffer *pBuffer = pWaylandFb ? pWaylandFb->GetHostBuffer() : nullptr;
@@ -1743,23 +1897,25 @@ namespace gamescope
         {
             pWaylandFb->OnCompositorAcquire();
 
+            const app_viewport::Rect layerRect = LayerRect( *pLayer );
+
             Present(
                 ClipPlane( WaylandPlaneState
                 {
                     .pBuffer     = pBuffer,
-                    .nDestX      = int32_t( -pLayer->offset.x ),
-                    .nDestY      = int32_t( -pLayer->offset.y ),
+                    .nDestX      = layerRect.nX,
+                    .nDestY      = layerRect.nY,
                     .flSrcX      = 0.0,
                     .flSrcY      = 0.0,
                     .flSrcWidth  = double( pLayer->tex->width() ),
                     .flSrcHeight = double( pLayer->tex->height() ),
-                    .nDstWidth   = int32_t( ceil( pLayer->tex->width() / double( pLayer->scale.x ) ) ),
-                    .nDstHeight  = int32_t( ceil( pLayer->tex->height() / double( pLayer->scale.y ) ) ),
+                    .nDstWidth   = int32_t( layerRect.uWidth ),
+                    .nDstHeight  = int32_t( layerRect.uHeight ),
                     .eColorspace = pLayer->colorspace,
                     .pHDRMetadata = pLayer->hdr_metadata_blob,
                     .bOpaque     = pLayer->zpos == g_zposBase,
                     .uFractionalScale = GetScale(),
-                } ) );
+                }, viewport ) );
         }
         else
         {
@@ -1832,8 +1988,13 @@ namespace gamescope
             nWidth  = WaylandScaleToLogical( g_nOutputWidth, uScale );
             nHeight = WaylandScaleToLogical( g_nOutputHeight, uScale );
         }
-        g_nOutputWidth  = WaylandScaleToPhysical( nWidth, uScale );
-        g_nOutputHeight = WaylandScaleToPhysical( nHeight, uScale );
+        const bool bHostDictated = !!( m_eWindowState & k_uHostDictatedWindowStates );
+        if ( std::optional<app_viewport::Rect> oOutput = m_pConnector->OnHostConfigure( bHostDictated,
+                WaylandScaleToPhysical( nWidth, uScale ), WaylandScaleToPhysical( nHeight, uScale ) ) )
+        {
+            g_nOutputWidth  = oOutput->uWidth;
+            g_nOutputHeight = oOutput->uHeight;
+        }
 
         CommitLibDecor( pConfiguration );
 
@@ -3217,8 +3378,8 @@ namespace gamescope
 
         uint32_t uScale = oState->uFractionalScale;
 
-        double flX = ( wl_fixed_to_double( fSurfaceX ) * uScale / 120.0 + oState->nDestX ) / g_nOutputWidth;
-        double flY = ( wl_fixed_to_double( fSurfaceY ) * uScale / 120.0 + oState->nDestY ) / g_nOutputHeight;
+        double flX = ( wl_fixed_to_double( fSurfaceX ) * uScale / 120.0 + oState->nOutputX ) / g_nOutputWidth;
+        double flY = ( wl_fixed_to_double( fSurfaceY ) * uScale / 120.0 + oState->nOutputY ) / g_nOutputHeight;
 
         wlserver_lock();
         wlserver_touchmotion( flX, flY, 0, ++m_uFakeTimestamp );
