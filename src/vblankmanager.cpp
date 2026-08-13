@@ -74,7 +74,7 @@ namespace gamescope
 
 	int CVBlankTimer::GetRefresh() const
 	{
-		return g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+		return g_nNestedRefresh ? int( g_nNestedRefresh ) : int( g_nOutputRefresh );
 	}
 
 	uint64_t CVBlankTimer::GetLastVBlank() const
@@ -401,7 +401,7 @@ namespace gamescope
 			else
 			{
 				// If we don't currently have a connector, make up some dummy refresh cycle.
-				sleep_for_nanos( mHzToRefreshCycle( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh ) );
+				sleep_for_nanos( mHzToRefreshCycle( g_nNestedRefresh ? int( g_nNestedRefresh ) : int( g_nOutputRefresh ) ) );
         		uint64_t ulNow = get_time_in_nanos();
 				schedule = VBlankScheduleTime
 				{

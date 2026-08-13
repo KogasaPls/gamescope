@@ -30,7 +30,7 @@ static std::function<void(const char*)> g_effectReadyCallback = nullptr;
 static auto g_runtimeUniforms = std::unordered_map<std::string, uint8_t*>();
 static std::mutex g_runtimeUniformsMutex;
 
-extern int g_nOutputRefresh;
+extern std::atomic< int > g_nOutputRefresh;
 
 static LogScope reshade_log("gamescope_reshade");
 
