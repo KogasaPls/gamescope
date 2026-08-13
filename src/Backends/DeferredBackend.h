@@ -331,6 +331,17 @@ namespace gamescope
             }
 		}
 
+        virtual std::optional<app_viewport::Rect> GetCaptureRegion() const override
+        {
+            {
+                std::shared_lock lock{ m_mutInit };
+                if ( m_bInittedChild )
+                    return m_pChild->GetCaptureRegion();
+            }
+
+            return std::nullopt;
+        }
+
         virtual bool NeedsFrameSync() const override
         {
             // Deferred backends do not support frame sync.
