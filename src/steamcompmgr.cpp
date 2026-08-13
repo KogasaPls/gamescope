@@ -98,6 +98,7 @@
 #include "reshade_effect_manager.hpp"
 #include "BufferMemo.h"
 #include "vrclient_detect.h"
+#include "x11_selection_requests.hpp"
 #include "Utils/Process.h"
 
 #include "wlr_begin.hpp"
@@ -169,8 +170,43 @@ uint64_t g_lastWinSeq = 0;
 
 static std::shared_ptr<gamescope::BackendBlob> s_scRGB709To2020Matrix;
 
-std::string clipboard;
-std::string primarySelection;
+// What we hold for one X selection: either the bytes themselves, or the MIME
+// types a host offer advertised, with the bytes still on the host until a
+// nested client converts the selection.
+struct SelectionEntry
+{
+	std::string sContents;
+	// The MIME type sContents is encoded as, or the empty string for a lazy entry.
+	std::string sMimeType;
+	std::vector<std::string> hostMimeTypes;
+	bool bLazy = false;
+};
+
+// Guards g_Selections: backend threads write via gamescope_set_selection().
+static std::mutex g_SelectionMutex;
+static SelectionEntry g_Selections[ GAMESCOPE_SELECTION_COUNT ];
+
+// Bumped whenever what we serve for a selection changes. A conversion carries
+// the value it was asked against, so bytes fetched for one host offer cannot
+// answer a request made against the next.
+static std::atomic<uint64_t> g_ulSelectionEpoch[ GAMESCOPE_SELECTION_COUNT ];
+
+static void drop_selection_fetch_results(GamescopeSelection eSelection);
+
+// Replacing the entry would otherwise free the previous selection's plaintext
+// with the bytes still in it. Growing to the capacity first reaches a string
+// that has been moved out of, which keeps the bytes past its length.
+static void replace_selection_entry(GamescopeSelection eSelection, SelectionEntry entry)
+{
+	std::string &sContents = g_Selections[eSelection].sContents;
+	sContents.resize( sContents.capacity(), '\0' );
+	explicit_bzero( sContents.data(), sContents.size() );
+
+	g_Selections[eSelection] = std::move( entry );
+
+	g_ulSelectionEpoch[eSelection]++;
+	drop_selection_fetch_results(eSelection);
+}
 
 std::string g_reshade_effect{};
 extern ReshadeEffectPipeline *g_pLastReshadeEffect;
@@ -6399,44 +6435,198 @@ handle_client_message(xwayland_ctx_t *ctx, XClientMessageEvent *ev)
 	}
 }
 
-static void x11_set_selection_owner(xwayland_ctx_t *ctx, std::string contents, GamescopeSelection eSelectionTarget)
+static Atom x11_selection_atom(xwayland_ctx_t *ctx, GamescopeSelection eSelectionTarget)
 {
-	Atom target;
 	if (eSelectionTarget == GAMESCOPE_SELECTION_CLIPBOARD)
-	{
-		target = ctx->atoms.clipboard;
-	}
-	else if (eSelectionTarget == GAMESCOPE_SELECTION_PRIMARY)
-	{
-		target = ctx->atoms.primarySelection;
-	}
-	else
-	{
-		return;
-	}
+		return ctx->atoms.clipboard;
 
-	XSetSelectionOwner(ctx->dpy, target, ctx->ourWindow, CurrentTime);
+	if (eSelectionTarget == GAMESCOPE_SELECTION_PRIMARY)
+		return ctx->atoms.primarySelection;
+
+	return None;
 }
 
-void gamescope_set_selection(std::string contents, GamescopeSelection eSelection)
+static std::optional<GamescopeSelection> x11_selection_for_atom(xwayland_ctx_t *ctx, Atom selection)
 {
-	if (eSelection == GAMESCOPE_SELECTION_CLIPBOARD)
+	if (selection == ctx->atoms.clipboard)
+		return GAMESCOPE_SELECTION_CLIPBOARD;
+
+	if (selection == ctx->atoms.primarySelection)
+		return GAMESCOPE_SELECTION_PRIMARY;
+
+	return std::nullopt;
+}
+
+static void x11_own_selection(xwayland_ctx_t *ctx, GamescopeSelection eSelectionTarget)
+{
+	const Atom target = x11_selection_atom(ctx, eSelectionTarget);
+	if (target == None)
+		return;
+
+	// Recorded before the request goes out: XFixes reports the acquisition to
+	// the steamcompmgr thread, and this can run on another one, so writing the
+	// record afterwards would clear a timestamp that arrived in between.
+	// TARGETS drops TIMESTAMP until that report, rather than naming the time of
+	// the acquisition this replaces.
+	ctx->ulSelectionOwnership[eSelectionTarget] = xwayland_ctx_t::k_ulSelectionOwned;
+
+	// Unconditionally, even when we already own it: Wine, GTK and Qt drop their
+	// cached clipboard on XFixesSetSelectionOwnerNotify, so a second host copy
+	// that raises no notify keeps serving them the previous content.
+	XSetSelectionOwner(ctx->dpy, target, ctx->ourWindow, CurrentTime);
+	XFlush(ctx->dpy);
+}
+
+static void x11_release_selection(xwayland_ctx_t *ctx, GamescopeSelection eSelectionTarget)
+{
+	const Atom target = x11_selection_atom(ctx, eSelectionTarget);
+	if (target == None)
+		return;
+
+	// X11 gates the request on the timestamp alone, so an unconditional
+	// release strips a nested client that owns the selection itself. Stamping
+	// it with the acquisition we are releasing makes the server ignore it once
+	// a client has taken the selection since, which is what the record cannot
+	// see until the event that says so is dispatched.
+	const uint64_t ulOwnership = ctx->ulSelectionOwnership[eSelectionTarget].load();
+	if (ulOwnership & xwayland_ctx_t::k_ulSelectionOwned)
 	{
-		clipboard = contents;
+		XSetSelectionOwner(ctx->dpy, target, None, Time(ulOwnership & xwayland_ctx_t::k_ulSelectionTimeMask));
+		XFlush(ctx->dpy);
 	}
-	else if (eSelection == GAMESCOPE_SELECTION_PRIMARY)
+
+	ctx->ulSelectionOwnership[eSelectionTarget] = 0;
+}
+
+// Same, for steamcompmgr's own thread, which is the only one that creates and
+// destroys Xwayland servers and so can walk them unlocked. The record can be
+// one dispatch stale, and waiting on an X reply is safe here because the
+// wlserver thread is free to keep servicing Xwayland.
+static void x11_release_selection_verified(GamescopeSelection eSelection)
+{
+	gamescope_xwayland_server_t *server = NULL;
+	for (int i = 0; (server = wlserver_get_xwayland_server(i)); i++)
 	{
-		primarySelection = contents;
+		xwayland_ctx_t *ctx = server->ctx.get();
+		if (!ctx)
+			continue;
+
+		const Atom target = x11_selection_atom(ctx, eSelection);
+		if (target == None)
+			continue;
+
+		const uint64_t ulOwnership = ctx->ulSelectionOwnership[eSelection].load();
+		if (XGetSelectionOwner(ctx->dpy, target) == ctx->ourWindow)
+		{
+			XSetSelectionOwner(ctx->dpy, target, None, Time(ulOwnership & xwayland_ctx_t::k_ulSelectionTimeMask));
+			XFlush(ctx->dpy);
+		}
+
+		ctx->ulSelectionOwnership[eSelection] = 0;
 	}
+}
+
+// The same walk for taking it, leaving alone any server where another client
+// owns the selection: a copy made in one server is then pasteable in the rest
+// without taking it from the client that made it.
+static void x11_own_selection_verified(GamescopeSelection eSelection)
+{
+	gamescope_xwayland_server_t *server = NULL;
+	for (int i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+	{
+		xwayland_ctx_t *ctx = server->ctx.get();
+		if (!ctx)
+			continue;
+
+		const Atom target = x11_selection_atom(ctx, eSelection);
+		if (target == None)
+			continue;
+
+		const Window owner = XGetSelectionOwner(ctx->dpy, target);
+		if (owner != None && owner != ctx->ourWindow)
+			continue;
+
+		x11_own_selection(ctx, eSelection);
+	}
+}
+
+// xwayland_servers can grow at runtime (wlserver_make_new_xwayland_server),
+// and backend threads land here, so walk it under the wlserver lock. No X reply
+// is waited on here, because the thread that services Xwayland is either the
+// caller or blocked on this lock.
+static void x11_publish_selection_locked(GamescopeSelection eSelection, bool bOwn)
+{
+	assert( wlserver_is_lock_held() );
 
 	gamescope_xwayland_server_t *server = NULL;
 	for (int i = 0; (server = wlserver_get_xwayland_server(i)); i++)
 	{
 		xwayland_ctx_t *ctx = server->ctx.get();
+		if (!ctx)
+			continue;
 
-		if (ctx)
-			x11_set_selection_owner(ctx, contents, eSelection);
+		if (bOwn)
+			x11_own_selection(ctx, eSelection);
+		else
+			x11_release_selection(ctx, eSelection);
 	}
+}
+
+void gamescope_set_selection_locked(std::string contents, std::string sMimeType, GamescopeSelection eSelection)
+{
+	assert( wlserver_is_lock_held() );
+
+	if (eSelection >= GAMESCOPE_SELECTION_COUNT)
+		return;
+
+	const bool bHaveContents = !contents.empty();
+	{
+		std::scoped_lock lock( g_SelectionMutex );
+		replace_selection_entry(eSelection, SelectionEntry{ .sContents = std::move( contents ), .sMimeType = std::move( sMimeType ) });
+	}
+
+	x11_publish_selection_locked(eSelection, bHaveContents);
+}
+
+void gamescope_set_selection(std::string contents, GamescopeSelection eSelection)
+{
+	wlserver_lock();
+	gamescope_set_selection_locked(std::move(contents), gamescope::wayland_selection::k_szUtf8MimeType, eSelection);
+	wlserver_unlock(false);
+}
+
+// The bytes a backend has published to the host, recorded without changing who
+// owns the X selection: a nested client owns it where it made the copy. This
+// replaces the announcement it supersedes, whose host offer the backend has
+// just dropped.
+void gamescope_set_selection_contents(std::string contents, std::string sMimeType, GamescopeSelection eSelection)
+{
+	if (eSelection >= GAMESCOPE_SELECTION_COUNT)
+		return;
+
+	{
+		std::scoped_lock lock( g_SelectionMutex );
+		replace_selection_entry(eSelection, SelectionEntry{ .sContents = std::move( contents ), .sMimeType = std::move( sMimeType ) });
+	}
+
+	x11_own_selection_verified(eSelection);
+}
+
+void gamescope_announce_selection(std::vector<std::string> mimeTypes, GamescopeSelection eSelection)
+{
+	if (eSelection >= GAMESCOPE_SELECTION_COUNT)
+		return;
+
+	wlserver_lock();
+
+	{
+		std::scoped_lock lock( g_SelectionMutex );
+		replace_selection_entry(eSelection, SelectionEntry{ .hostMimeTypes = std::move( mimeTypes ), .bLazy = true });
+	}
+
+	x11_publish_selection_locked(eSelection, true);
+
+	wlserver_unlock(false);
 }
 
 void gamescope_set_reshade_effect(std::string effect_path)
@@ -6450,57 +6640,306 @@ void gamescope_clear_reshade_effect() {
 	clear_prop(server->ctx.get(), server->ctx->atoms.gamescopeReshadeEffect);
 }
 
+static constexpr uint64_t k_ulSelectionRequestDeadlineNanos = 1'000'000'000ul;
+
+// Conversions nested clients asked for that the host has not answered yet.
+// Steamcompmgr thread only.
+static gamescope::x11_selection::RequestQueue g_SelectionRequests;
+
+struct SelectionFetchResult
+{
+	GamescopeSelection eSelection;
+	std::string sMimeType;
+	std::string sData;
+	bool bSuccess;
+	uint64_t ulEpoch;
+};
+
+static std::mutex g_SelectionFetchMutex;
+static std::vector<SelectionFetchResult> g_SelectionFetchResults;
+
+static void drop_selection_fetch_results(GamescopeSelection eSelection)
+{
+	std::scoped_lock lock( g_SelectionFetchMutex );
+	std::erase_if( g_SelectionFetchResults, [eSelection]( SelectionFetchResult &result )
+	{
+		if (result.eSelection != eSelection)
+			return false;
+
+		explicit_bzero( result.sData.data(), result.sData.size() );
+		return true;
+	} );
+}
+
+static gamescope::INestedHints *get_nested_hints()
+{
+	if (auto connector = GetBackend()->GetCurrentConnector())
+		return connector->GetNestedHints();
+
+	return nullptr;
+}
+
+void gamescope_deliver_selection_fetch(GamescopeSelection eSelection, std::string sMimeType, std::string sData, bool bSuccess, uint64_t ulEpoch)
+{
+	if (eSelection >= GAMESCOPE_SELECTION_COUNT)
+		return;
+
+	{
+		std::scoped_lock lock( g_SelectionFetchMutex );
+		g_SelectionFetchResults.push_back( SelectionFetchResult{ eSelection, std::move( sMimeType ), std::move( sData ), bSuccess, ulEpoch } );
+	}
+
+	nudge_steamcompmgr();
+}
+
+static bool x11_ctx_is_live(xwayland_ctx_t *ctx)
+{
+	gamescope_xwayland_server_t *server = NULL;
+	for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+	{
+		if (server->ctx.get() == ctx)
+			return true;
+	}
+
+	return false;
+}
+
+// std::string::resize to capacity so the whole allocation is scrubbed, not
+// just the bytes the plaintext currently spans.
+static void scrub_selection_bytes(std::string &sBytes)
+{
+	sBytes.resize( sBytes.capacity(), '\0' );
+	explicit_bzero( sBytes.data(), sBytes.size() );
+}
+
+static void execute_selection_action(const gamescope::x11_selection::Action &action)
+{
+	using gamescope::x11_selection::ActionKind;
+	xwayland_ctx_t *ctx = static_cast<xwayland_ctx_t *>(action.id.pCtx);
+	if (!x11_ctx_is_live(ctx))
+		return;
+
+	const Window requestor = Window(action.id.ulRequestor);
+	const Atom property = Atom(action.id.ulProperty);
+
+	XEvent response = {};
+	response.xselection.type = SelectionNotify;
+	response.xselection.selection = Atom(action.id.ulSelection);
+	response.xselection.requestor = requestor;
+	response.xselection.time = Time(action.id.ulTime);
+	response.xselection.property = None;
+	// ICCCM: a refusal echoes the request and signals itself with property None
+	// alone, so a requestor matching on target does not wait out its timeout.
+	response.xselection.target = Atom(action.id.ulTarget);
+
+	switch (action.eKind)
+	{
+	case ActionKind::AnswerTargets:
+	{
+		std::vector<Atom> targetList = { ctx->atoms.targets };
+		if (action.bIncludeTimestamp)
+			targetList.push_back(ctx->atoms.timestamp);
+		for (size_t uIndex : action.targetIndices)
+			targetList.push_back(ctx->atoms.selectionMimeTypes[uIndex]);
+		XChangeProperty(ctx->dpy, requestor, property, XA_ATOM, 32, PropModeReplace,
+				(unsigned char *)targetList.data(), targetList.size());
+		response.xselection.property = property;
+		break;
+	}
+	case ActionKind::AnswerTimestamp:
+	{
+		const long lOwnerTime = long(action.uTime);
+		XChangeProperty(ctx->dpy, requestor, property, XA_INTEGER, 32, PropModeReplace,
+				(const unsigned char *)&lOwnerTime, 1);
+		response.xselection.property = property;
+		break;
+	}
+	case ActionKind::AnswerBytes:
+		XChangeProperty(ctx->dpy, requestor, property, action.bUtf8Type ? ctx->atoms.utf8StringAtom : XA_STRING, 8, PropModeReplace,
+				(const unsigned char *)action.sBytes.data(), action.sBytes.length());
+		response.xselection.property = property;
+		break;
+	case ActionKind::Refuse:
+		break;
+	case ActionKind::QueueFetch:
+		return;
+	}
+
+	XSendEvent(ctx->dpy, requestor, False, NoEventMask, &response);
+	XFlush(ctx->dpy);
+}
+
+// Drains what the backend fetched and expires anything the host never
+// answered. Runs on the steamcompmgr thread, woken by nudge_steamcompmgr().
+static void update_pending_selection_requests()
+{
+	using namespace gamescope::x11_selection;
+
+	std::vector<SelectionFetchResult> results;
+	{
+		std::scoped_lock lock( g_SelectionFetchMutex );
+		results = std::move( g_SelectionFetchResults );
+		g_SelectionFetchResults.clear();
+	}
+
+	std::array<uint64_t, GAMESCOPE_SELECTION_COUNT> epochs;
+	for (size_t i = 0; i < epochs.size(); i++)
+		epochs[i] = g_ulSelectionEpoch[i].load();
+
+	for (const Action &action : OnTick( g_SelectionRequests, get_time_in_nanos(), epochs ))
+		execute_selection_action(action);
+
+	for (SelectionFetchResult &result : results)
+	{
+		for (Action &action : OnFetchDelivered( g_SelectionRequests, result.eSelection, result.sMimeType, result.sData, result.bSuccess, result.ulEpoch, epochs[result.eSelection] ))
+		{
+			execute_selection_action(action);
+			scrub_selection_bytes(action.sBytes);
+		}
+
+		scrub_selection_bytes(result.sData);
+	}
+}
+
 static void
 handle_selection_request(xwayland_ctx_t *ctx, XSelectionRequestEvent *ev)
 {
-	std::string *selection = ev->selection == ctx->atoms.primarySelection ? &primarySelection : &clipboard;
-
-	const char *targetString = XGetAtomName(ctx->dpy, ev->target);
-
-	XEvent response;
-	response.xselection.type = SelectionNotify;
-	response.xselection.selection = ev->selection;
-	response.xselection.requestor = ev->requestor;
-	response.xselection.time = ev->time;
-	response.xselection.property = None;
-	response.xselection.target = None;
-
 	if (ev->requestor == ctx->ourWindow)
 	{
 		return;
 	}
 
-	if (ev->target == ctx->atoms.targets)
-	{
-		Atom targetList[] = {
-			ctx->atoms.targets,
-			ctx->atoms.utf8StringAtom,
-		};
+	// ICCCM: a requestor that names no property is an obsolete client, and the
+	// target is the property name to reply under.
+	const Atom property = ev->property != None ? ev->property : ev->target;
 
-		XChangeProperty(ctx->dpy, ev->requestor, ev->property, XA_ATOM, 32, PropModeReplace,
-				(unsigned char *)&targetList, sizeof(targetList) / sizeof(targetList[0]));
-		response.xselection.property = ev->property;
-		response.xselection.target = ev->target;
-	}
-	else if (!strcmp(targetString, "text/plain;charset=utf-8") ||
-		!strcmp(targetString, "text/plain") ||
-		!strcmp(targetString, "TEXT") ||
-		!strcmp(targetString, "UTF8_STRING") ||
-		!strcmp(targetString, "STRING"))
-	{
+	XEvent response = {};
+	response.xselection.type = SelectionNotify;
+	response.xselection.selection = ev->selection;
+	response.xselection.requestor = ev->requestor;
+	response.xselection.time = ev->time;
+	response.xselection.property = None;
+	response.xselection.target = ev->target;
 
-		XChangeProperty(ctx->dpy, ev->requestor, ev->property, ev->target, 8, PropModeReplace,
-				(unsigned char *)selection->c_str(), selection->length());
-		response.xselection.property = ev->property;
-		response.xselection.target = ev->target;
-	}
-	else
+	// ourWindow also owns the manager selections, which carry nothing we serve.
+	const std::optional<GamescopeSelection> oSelection = x11_selection_for_atom(ctx, ev->selection);
+	if (!oSelection)
 	{
-		xwm_log.debugf("Unsupported clipboard type: %s.  Ignoring", targetString);
+		XSendEvent(ctx->dpy, ev->requestor, False, NoEventMask, &response);
+		XFlush(ctx->dpy);
+		return;
 	}
 
-	XSendEvent(ctx->dpy, ev->requestor, False, NoEventMask, &response);
-	XFlush(ctx->dpy);
+	const GamescopeSelection eSelection = *oSelection;
+
+	const char *targetString = XGetAtomName(ctx->dpy, ev->target);
+	defer( XFree( (void *)targetString ); );
+
+	using namespace gamescope::x11_selection;
+	const TargetKind eKind = ev->target == ctx->atoms.targets ? TargetKind::Targets
+		: ev->target == ctx->atoms.timestamp ? TargetKind::Timestamp
+		: targetString ? TargetKind::Text : TargetKind::Other;
+	const RequestId id{ ctx, ev->requestor, ev->selection, ev->target, property, ev->time };
+
+	std::vector<Action> actions;
+	{
+		std::scoped_lock lock( g_SelectionMutex );
+		const SelectionEntry &entry = g_Selections[eSelection];
+		const SlotView slot{ entry.sContents, entry.sMimeType, entry.hostMimeTypes, entry.bLazy,
+			g_ulSelectionEpoch[eSelection].load(),
+			uint32_t( ctx->ulSelectionOwnership[eSelection].load() & xwayland_ctx_t::k_ulSelectionTimeMask ) };
+
+		if (eKind == TargetKind::Text && slot.bLazy && g_SelectionRequests.parked.size() >= RequestQueue::k_uMaxParked)
+			xwm_log.errorf("More than %zu selection conversions waiting on the host; refusing one.", RequestQueue::k_uMaxParked);
+
+		actions = OnRequest( g_SelectionRequests, id, eSelection, eKind, targetString, slot,
+			get_time_in_nanos() + k_ulSelectionRequestDeadlineNanos );
+	}
+
+	for (Action &action : actions)
+	{
+		if (action.eKind == ActionKind::QueueFetch)
+		{
+			gamescope::INestedHints *hints = get_nested_hints();
+			if (!hints || !hints->FetchHostSelection(eSelection, action.sMimeType.c_str(), action.ulEpoch))
+			{
+				for (const Action &refusal : OnFetchQueueFailed(g_SelectionRequests, id))
+					execute_selection_action(refusal);
+			}
+			continue;
+		}
+
+		execute_selection_action(action);
+		scrub_selection_bytes(action.sBytes);
+	}
+}
+
+static void
+handle_selection_clear(xwayland_ctx_t *ctx, XSelectionClearEvent *ev)
+{
+	const std::optional<GamescopeSelection> oSelection = x11_selection_for_atom(ctx, ev->selection);
+	if (!oSelection)
+		return;
+
+	const GamescopeSelection eSelection = *oSelection;
+
+	// The release below comes back to us as a clear on every other server; by
+	// then we may have taken the selection again, and clearing the record here
+	// would drop the TIMESTAMP of the selection we now hold.
+	if (XGetSelectionOwner(ctx->dpy, ev->selection) == ctx->ourWindow)
+		return;
+
+	ctx->ulSelectionOwnership[eSelection] = 0;
+
+	bool bHadSelection;
+	{
+		std::scoped_lock lock( g_SelectionMutex );
+		SelectionEntry &entry = g_Selections[eSelection];
+		bHadSelection = entry.bLazy || !entry.sContents.empty();
+		if (bHadSelection)
+			replace_selection_entry(eSelection, SelectionEntry{});
+	}
+
+	if (!bHadSelection)
+		return;
+
+	// The host's offer is kept: it is still the host's selection, and a data
+	// control device cannot ask for it again once it is dropped, so it is what
+	// the session falls back to if this owner leaves without replacing it.
+
+	// A nested client took the selection in this server; releasing it in the
+	// others stops us serving what we no longer hold.
+	x11_release_selection_verified(eSelection);
+}
+
+// The owner of eSelection has gone without handing it on, so nothing in this
+// server serves it while the host still does. Take it back with the bytes we
+// published on the client's behalf, or with the host's own offer.
+static void x11_reclaim_selection(GamescopeSelection eSelection)
+{
+	bool bHaveContents;
+	bool bAlreadyLazy;
+	{
+		std::scoped_lock lock( g_SelectionMutex );
+		const SelectionEntry &entry = g_Selections[eSelection];
+		bHaveContents = !entry.bLazy && !entry.sContents.empty();
+		bAlreadyLazy = entry.bLazy;
+	}
+
+	// Replacing a lazy entry with the same announcement would bump the epoch and
+	// refuse the conversions already parked against it.
+	if (!bHaveContents && !bAlreadyLazy)
+	{
+		std::vector<std::string> hostMimeTypes;
+		gamescope::INestedHints *hints = get_nested_hints();
+		if (!hints || !hints->GetHostSelectionMimeTypes(eSelection, hostMimeTypes))
+			return;
+
+		std::scoped_lock lock( g_SelectionMutex );
+		replace_selection_entry(eSelection, SelectionEntry{ .hostMimeTypes = std::move( hostMimeTypes ), .bLazy = true });
+	}
+
+	x11_own_selection_verified(eSelection);
 }
 
 static void
@@ -6512,11 +6951,29 @@ handle_selection_notify(xwayland_ctx_t *ctx, XSelectionEvent *ev)
 	unsigned long bytes_after;
 	unsigned char *data = NULL;
 
+	// ICCCM: an owner that refused the conversion answers with property None.
+	// The previous entry must not keep serving the other servers and the host
+	// on behalf of an owner whose bytes we cannot read.
+	if (ev->property == None)
+	{
+		if (std::optional<GamescopeSelection> oSelection = x11_selection_for_atom(ctx, ev->selection))
+		{
+			std::scoped_lock lock( g_SelectionMutex );
+			replace_selection_entry(*oSelection, SelectionEntry{});
+		}
+		return;
+	}
+
 	XGetWindowProperty(ctx->dpy, ev->requestor, ev->property, 0, 0, False, AnyPropertyType,
 			&actual_type, &actual_format, &nitems, &bytes_after, &data);
 	if (data) {
 		XFree(data);
 	}
+
+	// ICCCM asks the requestor to delete the property once it has the value;
+	// leaving it holds the selection's plaintext on ourWindow for as long as
+	// Xwayland lives.
+	defer( XDeleteProperty(ctx->dpy, ev->requestor, ev->property); );
 
 	if (actual_type == ctx->atoms.utf8StringAtom && actual_format == 8) {
 		XGetWindowProperty(ctx->dpy, ev->requestor, ev->property, 0, bytes_after, False, AnyPropertyType,
@@ -8392,8 +8849,31 @@ void check_new_xdg_res()
 static void
 handle_xfixes_selection_notify( xwayland_ctx_t *ctx, XFixesSelectionNotifyEvent *event )
 {
+	const std::optional<GamescopeSelection> oSelection = x11_selection_for_atom(ctx, event->selection);
+
 	if (event->owner == ctx->ourWindow)
 	{
+		if (oSelection)
+		{
+			ctx->ulSelectionOwnership[*oSelection] =
+				xwayland_ctx_t::k_ulSelectionOwned | ( uint64_t( event->selection_timestamp ) & xwayland_ctx_t::k_ulSelectionTimeMask );
+		}
+		return;
+	}
+
+	// SelectionClear arrives a dispatch later, and the release path reads this
+	// record in between: a host clear in that window would strip the nested
+	// client that has just taken the selection.
+	if (oSelection)
+		ctx->ulSelectionOwnership[*oSelection] = 0;
+
+	if (event->owner == None)
+	{
+		// Only when the owner disappeared: a SetSelectionOwner to None is our
+		// own release, and taking it back would undo it.
+		if (oSelection && event->subtype != XFixesSetSelectionOwnerNotify)
+			x11_reclaim_selection(*oSelection);
+
 		return;
 	}
 
@@ -8542,6 +9022,9 @@ void xwayland_ctx_t::Dispatch()
 				break;
 			case SelectionRequest:
 				handle_selection_request(ctx, &ev.xselectionrequest);
+				break;
+			case SelectionClear:
+				handle_selection_clear(ctx, &ev.xselectionclear);
 				break;
 
 			default:
@@ -8859,6 +9342,9 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.clipboard = XInternAtom(ctx->dpy, "CLIPBOARD", false);
 	ctx->atoms.primarySelection = XInternAtom(ctx->dpy, "PRIMARY", false);
 	ctx->atoms.targets = XInternAtom(ctx->dpy, "TARGETS", false);
+	ctx->atoms.timestamp = XInternAtom(ctx->dpy, "TIMESTAMP", false);
+	for (size_t i = 0; i < gamescope::wayland_selection::k_SupportedMimeTypes.size(); i++)
+		ctx->atoms.selectionMimeTypes[i] = XInternAtom(ctx->dpy, gamescope::wayland_selection::k_SupportedMimeTypes[i], false);
 
 	ctx->atoms.wm_protocols = XInternAtom(ctx->dpy, "WM_PROTOCOLS", false);
 	ctx->atoms.wm_delete_window = XInternAtom(ctx->dpy, "WM_DELETE_WINDOW", false);
@@ -8900,8 +9386,12 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 				  PropertyChangeMask);
 	XShapeSelectInput(ctx->dpy, ctx->root, ShapeNotifyMask);
 	XFixesSelectCursorInput(ctx->dpy, ctx->root, XFixesDisplayCursorNotifyMask);
-	XFixesSelectSelectionInput(ctx->dpy, ctx->root, ctx->atoms.clipboard, XFixesSetSelectionOwnerNotifyMask);
-	XFixesSelectSelectionInput(ctx->dpy, ctx->root, ctx->atoms.primarySelection, XFixesSetSelectionOwnerNotifyMask);
+	// The close and destroy subtypes are what say an owner left without handing
+	// the selection on, which a SetSelectionOwner to None does not distinguish.
+	constexpr int k_nSelectionNotifyMask =
+		XFixesSetSelectionOwnerNotifyMask | XFixesSelectionWindowDestroyNotifyMask | XFixesSelectionClientCloseNotifyMask;
+	XFixesSelectSelectionInput(ctx->dpy, ctx->root, ctx->atoms.clipboard, k_nSelectionNotifyMask);
+	XFixesSelectSelectionInput(ctx->dpy, ctx->root, ctx->atoms.primarySelection, k_nSelectionNotifyMask);
 	XQueryTree(ctx->dpy, ctx->root, &root_return, &parent_return, &children, &nchildren);
 	for (uint32_t i = 0; i < nchildren; i++)
 		add_win(ctx, children[i], i ? children[i-1] : None, 0);
@@ -9812,6 +10302,8 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 		g_SteamCompMgrWaiter.PollEvents();
+
+		update_pending_selection_requests();
 
 		bool vblank = false;
 		if ( std::optional<gamescope::VBlankTime> pendingVBlank = GetVBlankTimer().ProcessVBlank() )

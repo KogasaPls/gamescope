@@ -2,6 +2,10 @@
 
 #include "backend.h"
 #include "waitable.h"
+#include "wayland_selection_helpers.hpp"
+
+#include <array>
+#include <atomic>
 
 #include <mutex>
 #include <memory>
@@ -261,10 +265,23 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 		Atom clipboard;
 		Atom primarySelection;
 		Atom targets;
+		Atom timestamp;
+		// The MIME types of wayland_selection::k_SupportedMimeTypes, interned
+		// in that order, as the selection targets we serve them under.
+		std::array<Atom, gamescope::wayland_selection::k_SupportedMimeTypes.size()> selectionMimeTypes;
 
 		Atom wm_protocols;
 		Atom wm_delete_window;
 	} atoms;
+
+	// Whether we hold each selection and, if so, the server time it was taken
+	// at, as one value: X timestamps are CARD32, so both fit in one atomic and
+	// a reader cannot see the flag of one acquisition against the time of
+	// another. Zero is "not ours"; k_ulSelectionOwned alone is "ours, and
+	// XFixes has not reported the time yet".
+	static constexpr uint64_t k_ulSelectionOwned = 1ull << 32;
+	static constexpr uint64_t k_ulSelectionTimeMask = 0xffffffffull;
+	std::atomic<uint64_t> ulSelectionOwnership[ GAMESCOPE_SELECTION_COUNT ] = {};
 
 	bool HasQueuedEvents();
 
