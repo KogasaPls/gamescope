@@ -270,6 +270,9 @@ namespace gamescope::Process
     static void ProcessPreSpawn()
     {
         ResetSignals();
+        // SIG_IGN survives exec(), unlike a handler, so a child would inherit
+        // gamescope's ignored SIGPIPE.
+        signal( SIGPIPE, SIG_DFL );
 
         RestoreFdLimit();
         RestoreNice();
