@@ -9633,6 +9633,9 @@ steamcompmgr_main(int argc, char **argv)
 					g_FadeOutDuration = atoi(optarg);
 				} else if (strcmp(opt_name, "force-windows-fullscreen") == 0) {
 					bForceWindowsFullscreen = true;
+				} else if (strcmp(opt_name, "track-app-size") == 0) {
+					g_bTrackAppSize = true;
+					g_flMaxWindowScale = 1.0f;
 				} else if (strcmp(opt_name, "hdr-enabled") == 0 || strcmp(opt_name, "hdr-enable") == 0) {
 					cv_hdr_enabled = true;
 				} else if (strcmp(opt_name, "hdr-debug-force-support") == 0) {
