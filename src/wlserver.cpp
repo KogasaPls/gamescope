@@ -1083,6 +1083,11 @@ static void gamescope_swapchain_factory_v2_create_swapchain( struct wl_client *c
 	if (wl_surface_info->gamescope_swapchains.size())
 		wl_log.errorf("create_swapchain: Surface already had a gamescope_swapchain! Warning!");
 
+	// The refresh cycle is tracked per surface but consumed per swapchain, and a
+	// new swapchain starts at the client's 60 Hz default. Without this the event
+	// is never re-sent to it, because the value has not changed.
+	wl_surface_info->last_refresh_cycle = 0;
+
 	wl_surface_info->gamescope_swapchains.emplace_back( gamescope_swapchain_resource );
 }
 
