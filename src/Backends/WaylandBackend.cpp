@@ -9,6 +9,7 @@
 #include "convar.h"
 #include "refresh_rate.h"
 #include "waitable.h"
+#include "hdr_metadata_sanitize.hpp"
 #include "Utils/TempFiles.h"
 
 #include <cstring>
@@ -691,6 +692,8 @@ namespace gamescope
         wl_surface *CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info );
 
         bool SupportsColorManagement() const;
+        bool SupportsGamescopeColorManagement() const { return m_WPColorManagerFeatures.bSupportsGamescopeColorManagement; }
+        bool SupportsColorspaceOnPlane( GamescopeAppTextureColorspace eColorspace ) const;
 
         void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info );
         void SetRelativeMouseMode( wl_surface *pSurface, bool bRelative );
@@ -712,7 +715,8 @@ namespace gamescope
         wp_presentation *GetPresentation() const { return m_pPresentation; }
         frog_color_management_factory_v1 *GetFrogColorManagementFactory() const { return m_pFrogColorMgmtFactory; }
         wp_color_manager_v1 *GetWPColorManager() const { return m_pWPColorManager; }
-        wp_image_description_v1 *GetWPImageDescription( GamescopeAppTextureColorspace eColorspace ) const { return m_pWPImageDescriptions[ (uint32_t)eColorspace ]; }
+        bool SupportsWPFeature( wp_color_manager_v1_feature eFeature ) const
+            { return Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, eFeature ); }
         wp_fractional_scale_manager_v1 *GetFractionalScaleManager() const { return m_pFractionalScaleManager; }
         xdg_toplevel_icon_manager_v1 *GetToplevelIconManager() const { return m_pToplevelIconManager; }
         libdecor *GetLibDecor() const { return m_pLibDecor; }
@@ -800,7 +804,6 @@ namespace gamescope
         wp_presentation *m_pPresentation = nullptr;
         frog_color_management_factory_v1 *m_pFrogColorMgmtFactory = nullptr;
         wp_color_manager_v1 *m_pWPColorManager = nullptr;
-        wp_image_description_v1 *m_pWPImageDescriptions[ GamescopeAppTextureColorspace_Count ]{};
         zwp_pointer_constraints_v1 *m_pPointerConstraints = nullptr;
         zwp_relative_pointer_manager_v1 *m_pRelativePointerManager = nullptr;
         wp_fractional_scale_manager_v1 *m_pFractionalScaleManager = nullptr;
@@ -1081,8 +1084,8 @@ namespace gamescope
             if ( g_bOutputHDREnabled )
                 bNeedsFullComposite |= g_bHDRItmEnable;
 
-            if ( !m_pBackend->SupportsColorManagement() )
-                bNeedsFullComposite |= ColorspaceIsHDR( pFrameInfo->layers.get( 0 ).colorspace );
+            for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
+                bNeedsFullComposite |= !m_pBackend->SupportsColorspaceOnPlane( pFrameInfo->layers.get( i ).colorspace );
 
             bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
 
@@ -1485,15 +1488,44 @@ namespace gamescope
                         m_pCurrentImageDescription = nullptr;
                     }
 
-                    if ( oState->eColorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB )
+                    // create_windows_scrgb is a fatal protocol error (unsupported_feature)
+                    // against a compositor that did not advertise WINDOWS_SCRGB -- which
+                    // includes wlroots as of 0.21, the exact hosts the relaxed
+                    // bSupportsGamescopeColorManagement gate exists for. Fall through and
+                    // leave m_pCurrentImageDescription null; the else branch below
+                    // unsets the image description instead.
+                    if ( oState->eColorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB &&
+                         m_pBackend->SupportsWPFeature( WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB ) )
                     {
                         m_pCurrentImageDescription = wp_color_manager_v1_create_windows_scrgb( m_pBackend->GetWPColorManager() );
                     }
-                    else if ( oState->eColorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ )
+                    // create_parametric_creator, set_tf_named and
+                    // set_primaries_named are each a fatal protocol error against a
+                    // host that advertised neither the parametric feature nor those
+                    // names. The gate checks exactly those three, so ask it here
+                    // rather than assume the path was only entered through it.
+                    else if ( oState->eColorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ &&
+                              m_pBackend->SupportsGamescopeColorManagement() )
                     {
                         wp_image_description_creator_params_v1 *pParams = wp_color_manager_v1_create_parametric_creator( m_pBackend->GetWPColorManager() );
 
-                        if ( close_enough( flScale, 1.0f ) )
+                        // set_primaries with raw values is a fatal protocol error
+                        // (unsupported_feature) unless the compositor advertised
+                        // SET_PRIMARIES, which the relaxed color-management gate no
+                        // longer requires. Fall back to the named BT2020 primaries
+                        // (ignoring the saturation scale) rather than aborting.
+                        bool bCanSetPrimaries = m_pBackend->SupportsWPFeature( WP_COLOR_MANAGER_V1_FEATURE_SET_PRIMARIES );
+                        if ( !close_enough( flScale, 1.0f ) && !bCanSetPrimaries )
+                        {
+                            static bool s_bWarnedNoSetPrimaries = false;
+                            if ( !s_bWarnedNoSetPrimaries )
+                            {
+                                s_bWarnedNoSetPrimaries = true;
+                                xdg_log.warnf( "hdr10_saturation_scale %f requested but the host compositor does not support set_primaries; using named BT2020 primaries instead.", flScale );
+                            }
+                        }
+
+                        if ( close_enough( flScale, 1.0f ) || !bCanSetPrimaries )
                         {
                             wp_image_description_creator_params_v1_set_primaries_named( pParams, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020 );
                         }
@@ -1514,26 +1546,62 @@ namespace gamescope
                         {
                             const hdr_metadata_infoframe *pInfoframe = &m_ColorState->pHDRMetadata->View<hdr_output_metadata>().hdmi_metadata_type1;
 
-                            wp_image_description_creator_params_v1_set_mastering_display_primaries( pParams,
-                                // Rescale...
-                                (((int32_t)pInfoframe->display_primaries[0].x) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[0].y) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[1].x) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[1].y) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[2].x) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->display_primaries[2].y) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->white_point.x) * 1'000'000) / 0xC350,
-                                (((int32_t)pInfoframe->white_point.y) * 1'000'000) / 0xC350);
+                            // set_mastering_luminance is defined only alongside
+                            // set_mastering_display_primaries, so the one feature
+                            // covers both; max_cll and max_fall are ungated.
+                            const bool bCanSetMastering = m_pBackend->SupportsWPFeature( WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES );
 
-                            wp_image_description_creator_params_v1_set_mastering_luminance( pParams,
+                            // CTA-861 counts chromaticity in units of 1/50000
+                            // and the protocol in 1/1000000, so the rescale is
+                            // exactly twenty; multiplying by a million first
+                            // overflows int for every coordinate above 0.043.
+                            constexpr int32_t k_nChromaticityScale = 1'000'000 / 0xC350;
+                            if ( bCanSetMastering )
+                            {
+                                wp_image_description_creator_params_v1_set_mastering_display_primaries( pParams,
+                                    ((int32_t)pInfoframe->display_primaries[0].x) * k_nChromaticityScale,
+                                    ((int32_t)pInfoframe->display_primaries[0].y) * k_nChromaticityScale,
+                                    ((int32_t)pInfoframe->display_primaries[1].x) * k_nChromaticityScale,
+                                    ((int32_t)pInfoframe->display_primaries[1].y) * k_nChromaticityScale,
+                                    ((int32_t)pInfoframe->display_primaries[2].x) * k_nChromaticityScale,
+                                    ((int32_t)pInfoframe->display_primaries[2].y) * k_nChromaticityScale,
+                                    ((int32_t)pInfoframe->white_point.x) * k_nChromaticityScale,
+                                    ((int32_t)pInfoframe->white_point.y) * k_nChromaticityScale);
+                            }
+
+                            const hdr_metadata::SanitizedHdrLuminance luminance = hdr_metadata::SanitizeHdrLuminance(
                                 pInfoframe->min_display_mastering_luminance,
-                                pInfoframe->max_display_mastering_luminance );
-
-                            wp_image_description_creator_params_v1_set_max_cll( pParams,
-                                pInfoframe->max_cll );
-
-                            wp_image_description_creator_params_v1_set_max_fall( pParams,
+                                pInfoframe->max_display_mastering_luminance,
+                                pInfoframe->max_cll,
                                 pInfoframe->max_fall );
+
+                            if ( bCanSetMastering && luminance.masteringLuminance )
+                            {
+                                wp_image_description_creator_params_v1_set_mastering_luminance( pParams,
+                                    luminance.masteringLuminance->first,
+                                    luminance.masteringLuminance->second );
+                            }
+
+                            if ( luminance.maxCll )
+                                wp_image_description_creator_params_v1_set_max_cll( pParams, *luminance.maxCll );
+
+                            if ( luminance.maxFall )
+                                wp_image_description_creator_params_v1_set_max_fall( pParams, *luminance.maxFall );
+
+                            static bool s_bWarnedDroppedLuminance = false;
+                            const bool bDroppedValue =
+                                ( !luminance.masteringLuminance && ( pInfoframe->min_display_mastering_luminance || pInfoframe->max_display_mastering_luminance ) ) ||
+                                ( !luminance.maxCll && pInfoframe->max_cll ) ||
+                                ( !luminance.maxFall && pInfoframe->max_fall );
+                            if ( !s_bWarnedDroppedLuminance && bDroppedValue )
+                            {
+                                s_bWarnedDroppedLuminance = true;
+                                xdg_log.warnf( "Dropped HDR static metadata the host would reject with invalid_luminance: mastering luminance %u to %u, max_cll %u, max_fall %u.",
+                                    uint32_t( pInfoframe->min_display_mastering_luminance ),
+                                    uint32_t( pInfoframe->max_display_mastering_luminance ),
+                                    uint32_t( pInfoframe->max_cll ),
+                                    uint32_t( pInfoframe->max_fall ) );
+                            }
                         }
                         m_pCurrentImageDescription = wp_image_description_creator_params_v1_create( pParams );
                     }
@@ -2023,17 +2091,15 @@ namespace gamescope
             m_WPColorManagerFeatures.bSupportsGamescopeColorManagement = [this]() -> bool
             {
                 // Features
+                // Only require what our named-primaries/named-tf HDR10 PQ parametric
+                // path actually uses. SET_PRIMARIES, SET_LUMINANCES, EXTENDED_TARGET_VOLUME
+                // and WINDOWS_SCRGB are for raw-value creation and the Windows scRGB path,
+                // which some compositors (e.g. wlroots as of 0.21) don't implement even
+                // though they fully support named-primaries HDR10 PQ. Gate those separately
+                // below instead of blocking HDR10 entirely on them.
                 if ( !Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC ) )
                     return false;
-                if ( !Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, WP_COLOR_MANAGER_V1_FEATURE_SET_PRIMARIES ) )
-                    return false;
                 if ( !Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES ) )
-                    return false;
-                if ( !Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, WP_COLOR_MANAGER_V1_FEATURE_EXTENDED_TARGET_VOLUME ) )
-                    return false;
-                if ( !Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES ) )
-                    return false;
-                if ( !Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB ) )
                     return false;
 
                 // Transfer Functions
@@ -2048,22 +2114,6 @@ namespace gamescope
 
                 return true;
             }();
-
-            if ( m_WPColorManagerFeatures.bSupportsGamescopeColorManagement )
-            {
-                // HDR10.
-                {
-                    wp_image_description_creator_params_v1 *pParams = wp_color_manager_v1_create_parametric_creator( m_pWPColorManager );
-                    wp_image_description_creator_params_v1_set_primaries_named( pParams, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020 );
-                    wp_image_description_creator_params_v1_set_tf_named( pParams, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ );
-                    m_pWPImageDescriptions[ GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ ] = wp_image_description_creator_params_v1_create( pParams );
-                }
-
-                // scRGB
-                {
-                    m_pWPImageDescriptions[ GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB ] = wp_color_manager_v1_create_windows_scrgb( m_pWPColorManager );
-                }
-            }
         }
 
         m_pLibDecor = libdecor_new( m_pDisplay, &s_LibDecorInterface );
@@ -2398,6 +2448,24 @@ namespace gamescope
     bool CWaylandBackend::SupportsColorManagement() const
     {
         return m_pFrogColorMgmtFactory != nullptr || ( m_pWPColorManager != nullptr && m_WPColorManagerFeatures.bSupportsGamescopeColorManagement );
+    }
+
+    bool CWaylandBackend::SupportsColorspaceOnPlane( GamescopeAppTextureColorspace eColorspace ) const
+    {
+        if ( !ColorspaceIsHDR( eColorspace ) )
+            return true;
+
+        // CWaylandPlane::Init binds the wp_color_manager surface whenever the
+        // host offers one, so frog is only ever consulted in its absence.
+        if ( m_pWPColorManager )
+        {
+            if ( eColorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB )
+                return SupportsWPFeature( WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB );
+
+            return m_WPColorManagerFeatures.bSupportsGamescopeColorManagement;
+        }
+
+        return m_pFrogColorMgmtFactory != nullptr;
     }
 
     void CWaylandBackend::SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info )
