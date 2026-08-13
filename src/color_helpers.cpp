@@ -228,9 +228,16 @@ inline void lerp_rgb(float* out, const float* a, const float* b, const float* c,
     lerp_rgb(out, v1, v2, x);
 }
 
+// The guard has to test __FINITE_MATH_ONLY__'s *value*, not just its presence.
+// GCC and Clang both define it unconditionally -- 0 for an ordinary build, 1
+// under -ffast-math or -ffinite-math-only -- so `defined(__FINITE_MATH_ONLY__)`
+// alone is always true and would drop the sanitization from every build,
+// including the IEEE-strict ones this patch exists to create. This file is the
+// one built with fast math, so the sanitized branch here is inert; it comes
+// back if that ever changes.
 inline float ClampAndSanitize( float a, float min, float max )
 {
-#ifndef __FAST_MATH__
+#if !( defined(__FAST_MATH__) || ( defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__ > 0 ) )
     return std::isfinite( a ) ? std::min(std::max(min, a), max) : min;
 #else
     return std::min(std::max(min, a), max);
