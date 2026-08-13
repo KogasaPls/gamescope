@@ -3109,6 +3109,17 @@ static void paint_pipewire()
 	currentOutputWidth = uWidth;
 	currentOutputHeight = uHeight;
 
+	// A backend that shows part of the output gets that part in the stream:
+	// the scene is laid out on the whole output and the shown part shifted to
+	// the buffer's origin.
+	std::optional<gamescope::app_viewport::CaptureLayout> oCropLayout;
+	if ( const std::optional<gamescope::app_viewport::Rect> oCaptureRegion = GetBackend()->GetCaptureRegion() )
+	{
+		oCropLayout = gamescope::app_viewport::ComputeCaptureLayout( *oCaptureRegion, uBackupWidth, uBackupHeight, uWidth, uHeight );
+		currentOutputWidth = oCropLayout->uCanvasWidth;
+		currentOutputHeight = oCropLayout->uCanvasHeight;
+	}
+
 	// Paint the windows we have onto the Pipewire stream.
 	steamcompmgr_win_t *fit = pFocus->overrideWindow;
 
@@ -3141,6 +3152,19 @@ static void paint_pipewire()
 	{
 		paint_window( pFocus, pFocus->overlayWindow, pFocus->overlayWindow, &frameInfo, nullptr, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter |
 				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 )  );
+	}
+
+	if ( oCropLayout )
+	{
+		for ( int i = 0; i < frameInfo.layers.count(); i++ )
+		{
+			frameInfo.layers.get( i ).offset.x += oCropLayout->flOriginX;
+			frameInfo.layers.get( i ).offset.y += oCropLayout->flOriginY;
+		}
+
+		// vulkan_screenshot dispatches over the current output size.
+		currentOutputWidth = uWidth;
+		currentOutputHeight = uHeight;
 	}
 
 	gamescope::Rc<CVulkanTexture> pRGBTexture = s_pPipewireBuffer->texture->isYcbcr()
@@ -10389,6 +10413,9 @@ steamcompmgr_main(int argc, char **argv)
 					g_FadeOutDuration = atoi(optarg);
 				} else if (strcmp(opt_name, "force-windows-fullscreen") == 0) {
 					bForceWindowsFullscreen = true;
+				} else if (strcmp(opt_name, "track-app-size") == 0) {
+					g_bTrackAppSize = true;
+					g_flMaxWindowScale = 1.0f;
 				} else if (strcmp(opt_name, "hdr-enabled") == 0 || strcmp(opt_name, "hdr-enable") == 0) {
 					cv_hdr_enabled = true;
 				} else if (strcmp(opt_name, "hdr-debug-force-support") == 0) {
@@ -11310,6 +11337,12 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 #if HAVE_PIPEWIRE
+		// The stream is sized to the part of the output the backend shows.
+		{
+			const std::optional<gamescope::app_viewport::Rect> oCaptureRegion = GetBackend()->GetCaptureRegion();
+			pipewire_set_capture_crop_size( oCaptureRegion ? oCaptureRegion->uWidth : 0, oCaptureRegion ? oCaptureRegion->uHeight : 0 );
+		}
+
 		// Drive on vblank, not the timer: under VRR the timer starves (page flips re-arm it).
 		if ( vblank && pipewire_is_streaming() && pipewire_capture_frame_due( GetVBlankTimer().GetRefresh() ) )
 			paint_pipewire();
