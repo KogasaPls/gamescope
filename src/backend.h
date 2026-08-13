@@ -8,6 +8,7 @@
 #include "rc.h"
 #include "drm_include.h"
 #include "Utils/Algorithm.h"
+#include "app_viewport_helpers.hpp"
 
 #include <cassert>
 #include <span>
@@ -358,6 +359,10 @@ namespace gamescope
             return this->GetCurrentConnector();
         }
         virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) = 0;
+
+        // The part of the output the backend shows, in output pixels, when
+        // that is less than the whole output. For the steamcompmgr thread only.
+        virtual std::optional<app_viewport::Rect> GetCaptureRegion() const { return std::nullopt; }
 
         virtual bool SupportsPlaneHardwareCursor() const = 0;
         virtual bool SupportsTearing() const = 0;
