@@ -8,6 +8,7 @@
 #include "gamescope-limiter-client-protocol.h"
 #include "../src/color_helpers.h"
 #include "../src/layer_defines.h"
+#include "../src/wsi_present_mode_helpers.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -29,8 +30,19 @@
 #include <unistd.h>
 
 #include "../src/messagey.h"
+#include "../src/Utils/Defer.h"
 
 using namespace std::literals;
+
+namespace {
+  VkPresentModeKHR MapPassthroughPresentMode(VkPresentModeKHR mode) {
+    return VkPresentModeKHR(gamescope::wsi::MapPassthroughPresentMode(
+      uint32_t(mode),
+      uint32_t(VK_PRESENT_MODE_FIFO_KHR),
+      uint32_t(VK_PRESENT_MODE_FIFO_RELAXED_KHR),
+      uint32_t(VK_PRESENT_MODE_MAILBOX_KHR)));
+  }
+}
 
 namespace GamescopeWSILayer {
 
@@ -269,6 +281,13 @@ namespace GamescopeWSILayer {
     const char *bypassEnv = getenv("GAMESCOPE_WSI_FORCE_BYPASS");
     if (bypassEnv && *bypassEnv && atoi(bypassEnv) != 0)
       flags |= GamescopeLayerClient::Flag::ForceBypass;
+
+    // Off by default: our FIFO is a per-vblank latch rule, not back-pressure on
+    // the client, so a MAILBOX driver swapchain leaves an app that paces itself
+    // off vkQueuePresentKHR blocking with no clock at all.
+    const char *presentModePassthroughEnv = getenv("GAMESCOPE_WSI_PRESENT_MODE_PASSTHROUGH");
+    if (presentModePassthroughEnv && *presentModePassthroughEnv && atoi(presentModePassthroughEnv) != 0)
+      flags |= GamescopeLayerClient::Flag::PresentModePassthrough;
 
     // My Little Pony: A Maretime Bay Adventure picks a HDR colorspace if available,
     // but does not render as HDR at all.
@@ -576,6 +595,7 @@ namespace GamescopeWSILayer {
     bool isWayland;
     bool isBypassingXWayland;
     bool forceFifo;
+    bool presentModePassthrough;
     VkPresentModeKHR presentMode;
     VkExtent2D extent;
     uint32_t serverId = 0;
@@ -1225,11 +1245,38 @@ namespace GamescopeWSILayer {
       if (!canBypass)
         swapchainInfo.surface = gamescopeSurface->fallbackSurface;
 
+      const bool passthrough = !!(gamescopeSurface->flags & GamescopeLayerClient::Flag::PresentModePassthrough);
+
       // We yolo to 3 min images always in Gamescope WSI, regardless of the underlying implementation.
       // Anyway, deal with present modes passed in...
+
+      // A struct already in the chain belongs to the app, which may create
+      // another swapchain with it, so it is only ours for this call.
+      auto *pAppPresentModesCreateInfo = const_cast<VkSwapchainPresentModesCreateInfoEXT *>(
+        vkroots::FindInChain<VkSwapchainPresentModesCreateInfoEXT>(&swapchainInfo));
+      std::optional<VkSwapchainPresentModesCreateInfoEXT> oRestoreAppPresentModesCreateInfo;
+      if (pAppPresentModesCreateInfo)
+        oRestoreAppPresentModesCreateInfo = *pAppPresentModesCreateInfo;
+      defer( if (oRestoreAppPresentModesCreateInfo) *pAppPresentModesCreateInfo = *oRestoreAppPresentModesCreateInfo; );
+
+      std::vector<VkPresentModeKHR> passthroughModes;
       vkroots::ChainPatcher<VkSwapchainPresentModesCreateInfoEXT>
         presentModePatcher(&swapchainInfo, [&](VkSwapchainPresentModesCreateInfoEXT *pPresentModesCreateInfo)
       {
+        if (passthrough) {
+          if (!pAppPresentModesCreateInfo)
+            return false;
+
+          for (uint32_t i = 0; i < pAppPresentModesCreateInfo->presentModeCount; i++) {
+            const VkPresentModeKHR mode = MapPassthroughPresentMode(pAppPresentModesCreateInfo->pPresentModes[i]);
+            if (std::find(passthroughModes.begin(), passthroughModes.end(), mode) == passthroughModes.end())
+              passthroughModes.push_back(mode);
+          }
+          pPresentModesCreateInfo->presentModeCount = uint32_t(passthroughModes.size());
+          pPresentModesCreateInfo->pPresentModes    = passthroughModes.data();
+          return true;
+        }
+
         // Always send MAILBOX as the mode to the driver, as we implement FIFO ourselves -- using the
         // Gamescope swapchain protocol.
         static constexpr std::array<VkPresentModeKHR, 1> s_MailboxMode = {{
@@ -1242,8 +1289,8 @@ namespace GamescopeWSILayer {
 
       // Force the colorspace to sRGB before sending to the driver.
       swapchainInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-      // We always send MAILBOX to the driver.
-      swapchainInfo.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+      // MAILBOX to the driver unless passing through.
+      swapchainInfo.presentMode = passthrough ? MapPassthroughPresentMode(pCreateInfo->presentMode) : VK_PRESENT_MODE_MAILBOX_KHR;
 
       uint32_t minImageCount = swapchainInfo.minImageCount;
       if (getEnsureMinImageCount())
@@ -1319,7 +1366,10 @@ namespace GamescopeWSILayer {
           .isWayland           = gamescopeSurface->isWayland(),
           .isBypassingXWayland = canBypass,
           .forceFifo           = gamescopeIsForcingFifo(gamescopeSurface->waylandObjects), // Were we forcing fifo when this swapchain was made?
-          .presentMode         = pCreateInfo->presentMode, // The new present mode.
+          // The decision actually taken at create, not the flag: the per-present
+          // patcher must agree with the compatibility set written here.
+          .presentModePassthrough = passthrough,
+          .presentMode         = passthrough ? MapPassthroughPresentMode(pCreateInfo->presentMode) : pCreateInfo->presentMode, // The new present mode.
           .extent              = pCreateInfo->imageExtent,
           .serverId            = serverId,
           .isHdrColorspace     = hdrColorspace,
@@ -1477,24 +1527,65 @@ namespace GamescopeWSILayer {
 
       // Grab the actual intended present modes.
       std::optional<VkSwapchainPresentModeInfoEXT> oOriginalPresentModeInfo;
-      const auto *pPresentModeInfo = vkroots::FindInChain<VkSwapchainPresentModeInfoEXT>(&presentInfo);
-      if (pPresentModeInfo)
-        oOriginalPresentModeInfo = *pPresentModeInfo;
+      auto *pAppPresentModeInfo = const_cast<VkSwapchainPresentModeInfoEXT *>(
+        vkroots::FindInChain<VkSwapchainPresentModeInfoEXT>(&presentInfo));
+      if (pAppPresentModeInfo)
+        oOriginalPresentModeInfo = *pAppPresentModeInfo;
 
-      // Force all present modes to MAILBOX to the underlying driver
-      // We implement fifo ourselves.
-      vkroots::ChainPatcher<VkSwapchainPresentModeInfoEXT, std::vector<VkPresentModeKHR>>
-        presentModePatcher(&presentInfo, [&](std::vector<VkPresentModeKHR>& mailboxModes, VkSwapchainPresentModeInfoEXT *pMaintenance1)
-      {
-        for (uint32_t i = 0; i < presentInfo.swapchainCount; i++) {
-          if (auto gamescopeSwapchain = GamescopeSwapchain::get(presentInfo.pSwapchains[i])) {
-            mailboxModes.emplace_back(VK_PRESENT_MODE_MAILBOX_KHR);
-          }
+      // MAILBOX to the underlying driver unless the swapchain passes through.
+      std::vector<gamescope::wsi::PresentModeSwapchain> modeSwapchains;
+      modeSwapchains.reserve(presentInfo.swapchainCount);
+      for (uint32_t i = 0; i < presentInfo.swapchainCount; i++) {
+        auto gamescopeSwapchain = GamescopeSwapchain::get(presentInfo.pSwapchains[i]);
+        modeSwapchains.emplace_back(gamescope::wsi::PresentModeSwapchain {
+          .bHooked      = bool(gamescopeSwapchain),
+          .bPassthrough = gamescopeSwapchain && gamescopeSwapchain->presentModePassthrough,
+        });
+      }
+
+      std::vector<uint32_t> appModeValues;
+      std::optional<std::span<const uint32_t>> oAppModes;
+      // A mode array shorter than the present's swapchain count cannot name a
+      // mode for every swapchain, and ComputeDriverPresentModes discards it for
+      // the same reason.
+      if (oOriginalPresentModeInfo && oOriginalPresentModeInfo->pPresentModes &&
+          oOriginalPresentModeInfo->swapchainCount >= presentInfo.swapchainCount) {
+        appModeValues.assign(
+          oOriginalPresentModeInfo->pPresentModes,
+          oOriginalPresentModeInfo->pPresentModes + presentInfo.swapchainCount);
+        oAppModes = std::span<const uint32_t>(appModeValues);
+      }
+
+      std::vector<VkPresentModeKHR> driverModes;
+      VkSwapchainPresentModeInfoEXT localModeInfo = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT,
+      };
+      std::optional<VkSwapchainPresentModeInfoEXT> oRestoreAppPresentModeInfo;
+      defer( if (oRestoreAppPresentModeInfo) *pAppPresentModeInfo = *oRestoreAppPresentModeInfo; );
+
+      if (auto oDriverModes = gamescope::wsi::ComputeDriverPresentModes(
+            modeSwapchains,
+            oAppModes,
+            uint32_t(VK_PRESENT_MODE_FIFO_KHR),
+            uint32_t(VK_PRESENT_MODE_FIFO_RELAXED_KHR),
+            uint32_t(VK_PRESENT_MODE_MAILBOX_KHR))) {
+        driverModes.reserve(oDriverModes->size());
+        for (uint32_t mode : *oDriverModes)
+          driverModes.emplace_back(VkPresentModeKHR(mode));
+
+        if (pAppPresentModeInfo) {
+          // The chain node belongs to the app, which may present with it again,
+          // so it is only ours for the duration of the call.
+          oRestoreAppPresentModeInfo = *pAppPresentModeInfo;
+          pAppPresentModeInfo->swapchainCount = presentInfo.swapchainCount;
+          pAppPresentModeInfo->pPresentModes  = driverModes.data();
+        } else {
+          localModeInfo.swapchainCount = presentInfo.swapchainCount;
+          localModeInfo.pPresentModes  = driverModes.data();
+          localModeInfo.pNext          = presentInfo.pNext;
+          presentInfo.pNext            = &localModeInfo;
         }
-
-        pMaintenance1->pPresentModes = mailboxModes.data();
-        return true;
-      });
+      }
 
 
       if (display) {
@@ -1532,7 +1623,12 @@ namespace GamescopeWSILayer {
             if (!gamescopeSwapchain->isWayland) {
               gamescope_swapchain_override_window_content(gamescopeSwapchain->object, gamescopeSwapchain->serverId, gamescopeSurface->window);
             }
-            VkPresentModeKHR presentMode = oOriginalPresentModeInfo ? oOriginalPresentModeInfo->pPresentModes[i] : gamescopeSwapchain->presentMode;
+            // A per-present mode also applies to every later present, so it
+            // becomes the fallback for presents that name none.
+            VkPresentModeKHR presentMode = oAppModes ? VkPresentModeKHR((*oAppModes)[i]) : gamescopeSwapchain->presentMode;
+            if (gamescopeSwapchain->presentModePassthrough)
+              presentMode = MapPassthroughPresentMode(presentMode);
+            gamescopeSwapchain->presentMode = presentMode;
             if (forceFifo && !frameLimiterAware)
               presentMode = VK_PRESENT_MODE_FIFO_KHR;
             gamescope_swapchain_set_present_mode(gamescopeSwapchain->object, uint32_t(presentMode));
