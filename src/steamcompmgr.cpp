@@ -1030,6 +1030,7 @@ struct global_focus_t : public focus_t
 	std::array< BaseLayerInfo_t, HELD_COMMIT_COUNT > CachedPlanes = {};
 	unsigned int uFadeOutStartTime = 0;
 	bool bPendingFade = false;
+	bool bPresentRetryPending = false;
 	GamescopeUpscaleFilter eActiveUpscaler = GamescopeUpscaleFilter::LINEAR;
 	uint64_t ulBasePlaneCommitID = 0;
 	uint32_t uBasePlaneAppID = 0;
@@ -3250,11 +3251,12 @@ gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay
 gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
 gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
 
-static void
+// False when this connector needs to retry the frame at the next vblank.
+static bool
 paint_all( global_focus_t *pFocus, bool async, bool bRepeatFrame )
 {
 	if ( !pFocus )
-		return;
+		return false;
 
 	gamescope::IBackendConnector *pConnector = pFocus->pVirtualConnector.get();
 	if ( !pConnector )
@@ -3540,7 +3542,7 @@ paint_all( global_focus_t *pFocus, bool async, bool bRepeatFrame )
 
 	if ( !bValidContents || GetBackend()->IsPaused() )
 	{
-		return;
+		return true;
 	}
 
 	unsigned int blurFadeTime = get_time_in_milliseconds() - g_BlurFadeStartTime;
@@ -3658,9 +3660,12 @@ paint_all( global_focus_t *pFocus, bool async, bool bRepeatFrame )
 		}
 	}
 
-	if ( pConnector && pConnector->Present( &frameInfo, async ) != 0 )
+	const int nPresentResult = pConnector ? pConnector->Present( &frameInfo, async ) : 0;
+	if ( nPresentResult != 0 )
 	{
-		return;
+		// Only a backend that dropped the frame for a retry leaves its damage
+		// pending; any other failure is the frame's end, as before.
+		return nPresentResult != -EAGAIN;
 	}
 
 	// A torn frame can be replaced before the next vblank pass reports it.
@@ -3842,7 +3847,7 @@ paint_all( global_focus_t *pFocus, bool async, bool bRepeatFrame )
 			if ( !oScreenshotSeq )
 			{
 				xwm_log.errorf("vulkan_screenshot failed");
-				return;
+				return true;
 			}
 
 			vulkan_wait( *oScreenshotSeq, false );
@@ -4079,6 +4084,8 @@ paint_all( global_focus_t *pFocus, bool async, bool bRepeatFrame )
 
 	gpuvis_trace_end_ctx_printf( paintID, "paint_all" );
 	gpuvis_trace_printf( "paint_all %i layers", (int)frameInfo.layers.count() );
+
+	return true;
 }
 
 /* Get prop from window
@@ -10911,6 +10918,10 @@ steamcompmgr_main(int argc, char **argv)
 		// Pick our width/height for this potential frame, regardless of how it might change later
 		// At some point we might even add proper locking so we get real updates atomically instead
 		// of whatever jumble of races the below might cause over a couple of frames
+		static uint32_t currentOutputRingDepth = 0;
+		const uint32_t uOutputRingDepth = GetBackend()->GetOutputRingDepth();
+		const bool bRingDepthChanged = currentOutputRingDepth != uOutputRingDepth;
+
 		const bool bHDROutputChanged = currentHDROutput != g_bOutputHDREnabled;
 
 		// The HDR flag only feeds the swapchain format; the output images on
@@ -10984,6 +10995,16 @@ steamcompmgr_main(int argc, char **argv)
 #if HAVE_PIPEWIRE
 			nudge_pipewire();
 #endif
+		}
+
+		if ( bRingDepthChanged )
+		{
+			if ( !bReconfigureOutput && !GetBackend()->UsesVulkanSwapchain() )
+			{
+				vulkan_remake_output_images();
+				hasRepaint = true;
+			}
+			currentOutputRingDepth = uOutputRingDepth;
 		}
 
 		if ( vblank )
@@ -11219,6 +11240,7 @@ steamcompmgr_main(int argc, char **argv)
 		if ( cv_adaptive_sync_ignore_overlay )
 			nIgnoredOverlayRepaints = 0;
 
+		const bool bForceRepaint = vblank && g_bForceRepaint.exchange( false );
 		for ( auto &iter : g_VirtualConnectorFocuses )
 		{
 			global_focus_t *pPaintFocus = &iter.second;
@@ -11266,10 +11288,9 @@ steamcompmgr_main(int argc, char **argv)
 
 			// If we are running behind, allow tearing.
 
-			// A false vblank value means bShouldPaint will resolve to false below, effectively ignoring this flag and losing any request
-			// to force a repaint. Don't clear g_bForceRepaint unless vblank is true.
-			const bool bForceRepaint = vblank && g_bForceRepaint.exchange(false);
-			const bool bForceSyncFlip = bForceRepaint || is_fading_out( pPaintFocus );
+			// A dropped frame belongs to this output even if another output consumed
+			// the global damage. Retry on vblank to avoid spinning on async wakeups.
+			const bool bForceSyncFlip = bForceRepaint || pPaintFocus->bPresentRetryPending || is_fading_out( pPaintFocus );
 
 			// If we are compositing, always force sync flips because we currently wait
 			// for composition to finish before submitting.
@@ -11387,9 +11408,9 @@ steamcompmgr_main(int argc, char **argv)
 
 			if ( bShouldPaint )
 			{
-				paint_all( pPaintFocus, eFlipType == FlipType::Async, bRepeatFrame );
-
-				bPainted = true;
+				const bool bFinished = paint_all( pPaintFocus, eFlipType == FlipType::Async, bRepeatFrame );
+				pPaintFocus->bPresentRetryPending = !bFinished;
+				bPainted |= bFinished;
 			}
 		}
 
