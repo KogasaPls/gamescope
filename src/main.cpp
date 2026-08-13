@@ -140,6 +140,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "force-composition-rotation", no_argument, nullptr, 0 },
 	{ "force-orientation", required_argument, nullptr, 0 },
 	{ "force-windows-fullscreen", no_argument, nullptr, 0 },
+	{ "track-app-size", no_argument, nullptr, 0 },
 
 	{ "disable-color-management", no_argument, nullptr, 0 },
 	{ "sdr-gamut-wideness", required_argument, nullptr, 0 },
@@ -206,6 +207,7 @@ const char usage[] =
 	"  --force-composition-rotation   always rotate the output in the compositor instead of at scanout (autodetected otherwise)\n"
 	"  --force-orientation            rotate the internal display (left, right, normal, upsidedown)\n"
 	"  --force-windows-fullscreen     force windows inside of gamescope to be the size of the nested display (fullscreen)\n"
+	"  --track-app-size               (nested/wayland) size the gamescope window to the focused app window at 1:1 (implies --max-scale 1; only with the auto scaler); the nested desktop size is unchanged\n"
 	"  --cursor-scale-height          if specified, sets a base output height to linearly scale the cursor against.\n"
 	"  --virtual-connector-strategy   Specifies how we should make virtual connectors.\n"
 	"  --hdr-enabled                  enable HDR output (needs Gamescope WSI layer enabled for support from clients)\n"
@@ -306,6 +308,7 @@ bool g_bOutputHDREnabled = false;
 
 bool g_bFullscreen = false;
 bool g_bForceRelativeMouse = false;
+bool g_bTrackAppSize = false;
 
 bool g_bGrabbed = false;
 
