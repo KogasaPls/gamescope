@@ -286,6 +286,15 @@ namespace gamescope
         virtual void SetReleasePoint( std::shared_ptr<CReleaseTimelinePoint> pReleasePoint ) = 0;
 
         virtual IBackendFb *EnsureImported() = 0;
+
+        // Does the consumer of this fb still own the underlying buffer, such
+        // that writing to it now would land on something being displayed?
+        //
+        // Only backends that can actually answer this override it. The
+        // default "no" keeps every other backend on exactly the behaviour it
+        // had before ownership tracking existed, rather than making them opt
+        // out of a check they cannot service.
+        virtual bool IsHeldByCompositor() const { return false; }
     };
 
     class IBackendPlane
@@ -328,6 +337,12 @@ namespace gamescope
 
         virtual void DirtyState( bool bForce = false, bool bForceModeset = false ) = 0;
         virtual bool PollState() = 0;
+
+        // Depth of the composited-output ring: one slot to render into plus
+        // one per buffer the consumer can hold. A nested wlroots host holds
+        // three per toplevel (the surface's committed buffer, the plane's
+        // current and queued framebuffers).
+        virtual uint32_t GetOutputRingDepth() const { return 3; }
 
         virtual std::shared_ptr<BackendBlob> CreateBackendBlob( const std::type_info &type, std::span<const uint8_t> data ) = 0;
         template <typename T>
