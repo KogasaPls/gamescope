@@ -410,14 +410,94 @@ void wlserver_open_steam_menu( bool qam )
 
 static void wlserver_drag_anchor_release();
 static void wlserver_drag_anchor_forget( struct wlr_surface *surface );
+static void wlserver_drag_anchor_apply( double &x, double &y );
+static struct wlr_surface *wlserver_pointer_surface_at( struct wlr_surface *surface, double x, double y, double *sx, double *sy );
+static void wlserver_update_pointer_focus( struct wlr_surface *surface, double sx, double sy );
+
+static void wlserver_apply_pending_mousefocus()
+{
+	if ( !wlserver.pending_mouse_focus.bPending || wlserver.wlr.seat->pointer_state.button_count > 0 )
+		return;
+
+	const auto pending = wlserver.pending_mouse_focus;
+	wlserver.pending_mouse_focus.bPending = false;
+	if ( pending.bCenter )
+		wlserver_mousefocus( pending.pSurface, INT32_MAX, INT32_MAX );
+	else
+		wlserver_mousefocus( pending.pSurface, int( wlserver.mouse_surface_cursorx ), int( wlserver.mouse_surface_cursory ) );
+
+	if ( wlserver.GetCursorConstraint() )
+		wlserver_update_cursor_constraint();
+}
+
+// The last release ends the implicit grab: a deferred focus change applies, or
+// else the surface under the cursor takes the pointer without waiting for motion.
+static void wlserver_end_pointer_grab()
+{
+	if ( wlserver.wlr.seat->pointer_state.button_count > 0 )
+		return;
+
+	if ( wlserver.pending_mouse_focus.bPending )
+	{
+		wlserver_apply_pending_mousefocus();
+		return;
+	}
+
+	double sx = wlserver.mouse_surface_cursorx;
+	double sy = wlserver.mouse_surface_cursory;
+	wlserver_drag_anchor_apply( sx, sy );
+
+	struct wlr_surface *focus = wlserver_pointer_surface_at( wlserver.mouse_focus_surface, sx, sy, &sx, &sy );
+	wlserver_update_pointer_focus( focus, sx, sy );
+}
+
+static void wlserver_release_held_pointer_buttons()
+{
+	struct wlr_seat_pointer_state *pState = &wlserver.wlr.seat->pointer_state;
+	if ( pState->button_count == 0 )
+		return;
+
+	uint32_t uButtons[ WLR_POINTER_BUTTONS_CAP ];
+	size_t uPressCounts[ WLR_POINTER_BUTTONS_CAP ];
+	const size_t uCount = pState->button_count;
+	for ( size_t i = 0; i < uCount; i++ )
+	{
+		uButtons[ i ] = pState->buttons[ i ].button;
+		uPressCounts[ i ] = pState->buttons[ i ].n_pressed;
+	}
+
+	for ( size_t i = 0; i < uCount; i++ )
+	{
+		for ( size_t uPress = 0; uPress < uPressCounts[ i ]; uPress++ )
+			wlr_seat_pointer_notify_button( wlserver.wlr.seat, wlserver.last_pointer_button_time, uButtons[ i ], WL_POINTER_BUTTON_STATE_RELEASED );
+	}
+	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+}
+
+void wlserver_pointer_left()
+{
+	assert( wlserver_is_lock_held() );
+
+	if ( !wlserver.wlr.seat )
+		return;
+
+	wlserver_release_held_pointer_buttons();
+	// Without an anchor the release would only cancel a pending settle, which a
+	// leave must not do.
+	if ( wlserver.drag_anchor.surface )
+		wlserver_drag_anchor_release();
+	wlserver_apply_pending_mousefocus();
+}
 
 static void wlserver_handle_pointer_button(struct wl_listener *listener, void *data)
 {
 	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, button );
 	struct wlr_pointer_button_event *event = (struct wlr_pointer_button_event *) data;
 
+	wlserver.last_pointer_button_time = event->time_msec;
 	wlr_seat_pointer_notify_button( wlserver.wlr.seat, event->time_msec, event->button, event->state );
 	wlserver_drag_anchor_release();
+	wlserver_end_pointer_grab();
 }
 
 static void wlserver_handle_pointer_axis(struct wl_listener *listener, void *data)
@@ -739,7 +819,17 @@ static void handle_wl_surface_destroy( struct wl_listener *l, void *data )
 	}
 
 	if ( surf->wlr == wlserver.mouse_focus_surface )
+	{
+		wlserver_release_held_pointer_buttons();
+		if ( wlserver.drag_anchor.surface )
+			wlserver_drag_anchor_release();
 		wlserver.mouse_focus_surface = nullptr;
+	}
+
+	if ( surf->wlr == wlserver.pending_mouse_focus.pSurface )
+		wlserver.pending_mouse_focus.bPending = false;
+
+	wlserver_apply_pending_mousefocus();
 
 	wlserver_drag_anchor_forget( surf->wlr );
 
@@ -2151,7 +2241,15 @@ static void waylandy_surface_destroy(struct wl_listener *listener, void *data) {
 		if (wlserver.kb_focus_surface == info->main_surface)
 			wlserver.kb_focus_surface = nullptr;
 		if (wlserver.mouse_focus_surface == info->main_surface)
+		{
+			wlserver_release_held_pointer_buttons();
+			if (wlserver.drag_anchor.surface)
+				wlserver_drag_anchor_release();
 			wlserver.mouse_focus_surface = nullptr;
+		}
+		if (wlserver.pending_mouse_focus.pSurface == info->main_surface)
+			wlserver.pending_mouse_focus.bPending = false;
+		wlserver_apply_pending_mousefocus();
 		wlserver_drag_anchor_forget( info->main_surface );
 		wlserver_surface = get_wl_surface_info(info->main_surface);
 	}
@@ -3073,10 +3171,64 @@ static void wlserver_clampcursor()
 	wlserver.mouse_surface_cursory = std::clamp( wlserver.mouse_surface_cursory, 0.0, double( std::max( nHeight - 1, 0 ) ) );
 }
 
+struct wlserver_popup_surface_search
+{
+	struct wlr_surface *pSurface;
+	int nX = 0;
+	int nY = 0;
+	bool bFound = false;
+};
+
+// While a button is held, the seat's pointer focus keeps the pointer if it is
+// the root surface or one of its popup surfaces, with coordinates local to it.
+// Returns nullptr when no button is held or the focus is not in that tree.
+static struct wlr_surface *wlserver_held_pointer_surface( struct wlr_surface *root, double x, double y, double *sx, double *sy )
+{
+	struct wlr_seat_pointer_state *pState = &wlserver.wlr.seat->pointer_state;
+	struct wlr_surface *pHeld = pState->focused_surface;
+	if ( pState->button_count == 0 || !pHeld )
+		return nullptr;
+
+	if ( pHeld == root )
+	{
+		*sx = x;
+		*sy = y;
+		return root;
+	}
+
+	struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface( root );
+	if ( !xdg_surface )
+		return nullptr;
+
+	wlserver_popup_surface_search search = { .pSurface = pHeld };
+	wlr_xdg_surface_for_each_popup_surface( xdg_surface, []( struct wlr_surface *pSurface, int nX, int nY, void *pData )
+	{
+		auto *pSearch = static_cast<wlserver_popup_surface_search *>( pData );
+		if ( pSearch->bFound || pSurface != pSearch->pSurface )
+			return;
+
+		pSearch->nX = nX;
+		pSearch->nY = nY;
+		pSearch->bFound = true;
+	}, &search );
+
+	if ( !search.bFound )
+		return nullptr;
+
+	*sx = x - search.nX;
+	*sy = y - search.nY;
+	return pHeld;
+}
+
 static struct wlr_surface *wlserver_pointer_surface_at( struct wlr_surface *surface, double x, double y, double *sx, double *sy )
 {
 	if ( !surface )
 		return nullptr;
+
+	// wlroots forgets held buttons when pointer focus changes surface, so the
+	// surface that saw the press keeps the pointer until the release.
+	if ( struct wlr_surface *held = wlserver_held_pointer_surface( surface, x, y, sx, sy ) )
+		return held;
 
 	if ( struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface( surface ) )
 		if ( struct wlr_surface *hit = wlr_xdg_surface_popup_surface_at( xdg_surface, x, y, sx, sy ) )
@@ -3098,6 +3250,16 @@ static void wlserver_update_pointer_focus( struct wlr_surface *surface, double s
 void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x /* = 0 */, int y /* = 0 */ )
 {
 	assert( wlserver_is_lock_held() );
+
+	// An implicit grab: a client that saw a press must see the release, and
+	// wlroots forgets held buttons when pointer focus changes surface
+	// (reset_buttons in wlr_seat_pointer.c), so the change waits for it.
+	if ( wlserver.mouse_focus_surface && wlrsurface != wlserver.mouse_focus_surface && wlserver.wlr.seat->pointer_state.button_count > 0 )
+	{
+		wlserver.pending_mouse_focus = { wlrsurface, x == INT32_MAX || y == INT32_MAX, true };
+		return;
+	}
+	wlserver.pending_mouse_focus.bPending = false;
 
 	if ( wlserver.mouse_focus_surface == wlrsurface )
 	{
@@ -3202,6 +3364,16 @@ static void wlserver_update_cursor_constraint()
 {
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
 	pixman_region32_t *pRegion = &pConstraint->region;
+
+	// The constraint follows keyboard focus, which is not deferred, so while a
+	// pointer focus change waits for a held button the constraint can belong to
+	// a surface the cursor is not on, and the cursor coordinates it confines
+	// are still the focused surface's.
+	if ( wlserver.pending_mouse_focus.bPending && pConstraint->surface != wlserver.mouse_focus_surface )
+	{
+		pixman_region32_clear( &wlserver.confine );
+		return;
+	}
 
 	if ( wlserver.mouse_constraint_requires_warp && pConstraint->surface )
 	{
@@ -3324,6 +3496,12 @@ static bool wlserver_apply_constraint( double *dx, double *dy )
 {
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
 
+	// A constraint set for a surface that does not have the pointer yet cannot
+	// bound the coordinates of the surface that does, and a locked one would
+	// refuse every motion until the held button is released.
+	if ( pConstraint && wlserver.pending_mouse_focus.bPending && pConstraint->surface != wlserver.mouse_focus_surface )
+		return true;
+
 	if ( pConstraint )
 	{
 		if ( pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED )
@@ -3427,9 +3605,11 @@ void wlserver_mousebutton( int button, bool press, uint32_t time )
 
 	wlserver_oncursorevent();
 
+	wlserver.last_pointer_button_time = time;
 	wlr_seat_pointer_notify_button( wlserver.wlr.seat, time, button, press ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED );
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 	wlserver_drag_anchor_release();
+	wlserver_end_pointer_grab();
 }
 
 void wlserver_mousewheel( double flX, double flY, uint32_t time )
@@ -3638,6 +3818,7 @@ void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamesc
 
 			if ( button != 0 && eMode < WLSERVER_BUTTON_COUNT && !wlserver.button_held[ eMode ] )
 			{
+				wlserver.last_pointer_button_time = time;
 				wlr_seat_pointer_notify_button( wlserver.wlr.seat, time, button, WL_POINTER_BUTTON_STATE_PRESSED );
 				wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 
@@ -3683,6 +3864,10 @@ void wlserver_touchup( int touch_id, uint32_t time )
 	}
 
 	wlserver_drag_anchor_release();
+	if ( bReleasedAny )
+		wlserver_end_pointer_grab();
+	else
+		wlserver_apply_pending_mousefocus();
 	bump_input_counter();
 }
 
