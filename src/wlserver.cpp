@@ -368,13 +368,63 @@ void wlserver_open_steam_menu( bool qam )
 static void wlserver_drag_anchor_release();
 static void wlserver_drag_anchor_forget( struct wlr_surface *surface );
 
+static void wlserver_apply_pending_mousefocus()
+{
+	if ( !wlserver.pending_mouse_focus.bPending || wlserver.wlr.seat->pointer_state.button_count > 0 )
+		return;
+
+	const auto pending = wlserver.pending_mouse_focus;
+	wlserver.pending_mouse_focus.bPending = false;
+	wlserver_mousefocus( pending.pSurface, pending.nX, pending.nY );
+
+	if ( wlserver.GetCursorConstraint() )
+		wlserver_update_cursor_constraint();
+}
+
+static void wlserver_release_held_pointer_buttons()
+{
+	struct wlr_seat_pointer_state *pState = &wlserver.wlr.seat->pointer_state;
+	if ( pState->button_count == 0 )
+		return;
+
+	uint32_t uButtons[ WLR_POINTER_BUTTONS_CAP ];
+	size_t uPressCounts[ WLR_POINTER_BUTTONS_CAP ];
+	const size_t uCount = pState->button_count;
+	for ( size_t i = 0; i < uCount; i++ )
+	{
+		uButtons[ i ] = pState->buttons[ i ].button;
+		uPressCounts[ i ] = pState->buttons[ i ].n_pressed;
+	}
+
+	for ( size_t i = 0; i < uCount; i++ )
+	{
+		for ( size_t uPress = 0; uPress < uPressCounts[ i ]; uPress++ )
+			wlr_seat_pointer_notify_button( wlserver.wlr.seat, wlserver.last_pointer_button_time, uButtons[ i ], WL_POINTER_BUTTON_STATE_RELEASED );
+	}
+	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+}
+
+void wlserver_pointer_left()
+{
+	assert( wlserver_is_lock_held() );
+
+	wlserver_release_held_pointer_buttons();
+	// Without an anchor the release would only cancel a pending settle, which a
+	// leave must not do.
+	if ( wlserver.drag_anchor.surface )
+		wlserver_drag_anchor_release();
+	wlserver_apply_pending_mousefocus();
+}
+
 static void wlserver_handle_pointer_button(struct wl_listener *listener, void *data)
 {
 	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, button );
 	struct wlr_pointer_button_event *event = (struct wlr_pointer_button_event *) data;
 
+	wlserver.last_pointer_button_time = event->time_msec;
 	wlr_seat_pointer_notify_button( wlserver.wlr.seat, event->time_msec, event->button, event->state );
 	wlserver_drag_anchor_release();
+	wlserver_apply_pending_mousefocus();
 }
 
 static void wlserver_handle_pointer_axis(struct wl_listener *listener, void *data)
@@ -475,6 +525,8 @@ static void wlserver_handle_touch_motion(struct wl_listener *listener, void *dat
 static void wlserver_handle_pointer_destroy(struct wl_listener *listener, void *data)
 {
 	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, destroy );
+
+	wlserver_pointer_left();
 
 	wl_list_remove( &pointer->motion.link );
 	wl_list_remove( &pointer->button.link );
@@ -619,7 +671,16 @@ static void handle_wl_surface_destroy( struct wl_listener *l, void *data )
 	}
 
 	if ( surf->wlr == wlserver.mouse_focus_surface )
+	{
+		wlserver_release_held_pointer_buttons();
+		wlserver_drag_anchor_release();
 		wlserver.mouse_focus_surface = nullptr;
+	}
+
+	if ( surf->wlr == wlserver.pending_mouse_focus.pSurface )
+		wlserver.pending_mouse_focus.bPending = false;
+
+	wlserver_apply_pending_mousefocus();
 
 	wlserver_drag_anchor_forget( surf->wlr );
 
@@ -1940,7 +2001,14 @@ static void waylandy_surface_destroy(struct wl_listener *listener, void *data) {
 		if (wlserver.kb_focus_surface == info->main_surface)
 			wlserver.kb_focus_surface = nullptr;
 		if (wlserver.mouse_focus_surface == info->main_surface)
+		{
+			wlserver_release_held_pointer_buttons();
+			wlserver_drag_anchor_release();
 			wlserver.mouse_focus_surface = nullptr;
+		}
+		if (wlserver.pending_mouse_focus.pSurface == info->main_surface)
+			wlserver.pending_mouse_focus.bPending = false;
+		wlserver_apply_pending_mousefocus();
 		wlserver_drag_anchor_forget( info->main_surface );
 		wlserver_surface = get_wl_surface_info(info->main_surface);
 	}
@@ -2684,6 +2752,16 @@ void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x /* = 0 */, int y
 {
 	assert( wlserver_is_lock_held() );
 
+	// An implicit grab: a client that saw a press must see the release, and
+	// wlroots forgets held buttons when pointer focus changes surface
+	// (reset_buttons in wlr_seat_pointer.c), so the change waits for it.
+	if ( wlserver.mouse_focus_surface && wlrsurface != wlserver.mouse_focus_surface && wlserver.wlr.seat->pointer_state.button_count > 0 )
+	{
+		wlserver.pending_mouse_focus = { wlrsurface, x, y, true };
+		return;
+	}
+	wlserver.pending_mouse_focus.bPending = false;
+
 	if ( wlserver.mouse_focus_surface == wlrsurface )
 	{
 		wlserver_clampcursor();
@@ -2784,6 +2862,16 @@ static void wlserver_update_cursor_constraint()
 {
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
 	pixman_region32_t *pRegion = &pConstraint->region;
+
+	// The constraint follows keyboard focus, which is not deferred, so while a
+	// pointer focus change waits for a held button the constraint can belong to
+	// a surface the cursor is not on, and the cursor coordinates it confines
+	// are still the focused surface's.
+	if ( wlserver.pending_mouse_focus.bPending && pConstraint->surface != wlserver.mouse_focus_surface )
+	{
+		pixman_region32_clear( &wlserver.confine );
+		return;
+	}
 
 	if ( wlserver.mouse_constraint_requires_warp && pConstraint->surface )
 	{
@@ -2906,6 +2994,12 @@ static bool wlserver_apply_constraint( double *dx, double *dy )
 {
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
 
+	// A constraint set for a surface that does not have the pointer yet cannot
+	// bound the coordinates of the surface that does, and a locked one would
+	// refuse every motion until the held button is released.
+	if ( pConstraint && wlserver.pending_mouse_focus.bPending && pConstraint->surface != wlserver.mouse_focus_surface )
+		return true;
+
 	if ( pConstraint )
 	{
 		if ( pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED )
@@ -3003,9 +3097,11 @@ void wlserver_mousebutton( int button, bool press, uint32_t time )
 
 	wlserver_oncursorevent();
 
+	wlserver.last_pointer_button_time = time;
 	wlr_seat_pointer_notify_button( wlserver.wlr.seat, time, button, press ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED );
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 	wlserver_drag_anchor_release();
+	wlserver_apply_pending_mousefocus();
 }
 
 void wlserver_mousewheel( double flX, double flY, uint32_t time )
@@ -3214,6 +3310,7 @@ void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamesc
 
 			if ( button != 0 && eMode < WLSERVER_BUTTON_COUNT )
 			{
+				wlserver.last_pointer_button_time = time;
 				wlr_seat_pointer_notify_button( wlserver.wlr.seat, time, button, WL_POINTER_BUTTON_STATE_PRESSED );
 				wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 
@@ -3251,6 +3348,8 @@ void wlserver_touchup( int touch_id, uint32_t time )
 	{
 		wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 	}
+
+	wlserver_apply_pending_mousefocus();
 
 	if ( wlserver.touch_down_ids.count( touch_id ) > 0 )
 	{
