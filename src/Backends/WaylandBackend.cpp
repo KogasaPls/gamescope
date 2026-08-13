@@ -8,6 +8,7 @@
 #include "Utils/Defer.h"
 #include "Utils/Algorithm.h"
 #include "app_viewport_helpers.hpp"
+#include "WaylandSelection.hpp"
 #include "convar.h"
 #include "refresh_rate.h"
 #include "waitable.h"
@@ -779,6 +780,7 @@ namespace gamescope
     {
     public:
         CWaylandBackend();
+        ~CWaylandBackend();
 
         /////////////
         // IBackend
@@ -1062,6 +1064,7 @@ namespace gamescope
         uint32_t m_uPointerEnterSerial = 0;
         bool m_bMouseEntered = false;
         uint32_t m_uKeyboardEnterSerial = 0;
+        CWaylandSelection m_Selection;
         bool m_bKeyboardEntered = false;
 
         uint32_t m_uGlobalFractionalScale = 120;
@@ -1681,6 +1684,9 @@ namespace gamescope
 
     void CWaylandConnector::SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection )
     {
+        if ( m_pBackend->m_Selection.SetSelection( szContents, eSelection, m_pBackend->m_bKeyboardEntered ) )
+            return;
+
         if ( m_pBackend->m_pDataDeviceManager && !m_pBackend->m_pDataDevice )
             m_pBackend->m_pDataDevice = wl_data_device_manager_get_data_device( m_pBackend->m_pDataDeviceManager, m_pBackend->m_pSeat );
 
@@ -2547,6 +2553,11 @@ namespace gamescope
     {
     }
 
+    CWaylandBackend::~CWaylandBackend()
+    {
+        m_Selection.Shutdown();
+    }
+
     bool CWaylandBackend::Init()
     {
         g_nOutputWidth = g_nPreferredOutputWidth;
@@ -2653,6 +2664,8 @@ namespace gamescope
             xdg_log.errorf( "Failed to initialize input thread" );
             return false;
         }
+
+        m_Selection.Init( m_pDisplay, m_pSeat );
 
         xdg_log.infof( "Initted Wayland backend" );
 
@@ -3155,6 +3168,8 @@ namespace gamescope
 
     void CWaylandBackend::Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion )
     {
+        m_Selection.BindGlobal( pRegistry, uName, pInterface, uVersion );
+
         if ( !strcmp( pInterface, wl_compositor_interface.name ) && uVersion >= 4u )
         {
             m_pCompositor = (wl_compositor *)wl_registry_bind( pRegistry, uName, &wl_compositor_interface, 4u );
@@ -3370,6 +3385,8 @@ namespace gamescope
 
         m_uKeyboardEnterSerial = uSerial;
         m_bKeyboardEntered = true;
+
+        m_Selection.PublishPendingSelections();
 
         UpdateCursor();
     }
