@@ -188,6 +188,8 @@ struct wsi_memory_allocate_info {
     VkStructureType sType;
     const void *pNext;
     bool implicit_sync;
+    bool dma_buf_sync_file;
+    bool reserved[6]; // To avoid issues down the line.
 };
 
 // DRM doesn't always have 32bit floating point formats, so add our own if necessary
@@ -2253,12 +2255,15 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
 	{
-		// We want to scan-out the image
-		wsiImageCreateInfo = {
-			.sType = VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA,
-			.pNext = std::exchange(imageInfo.pNext, &wsiImageCreateInfo),
-			.scanout = VK_TRUE,
-		};
+		// We want to scan-out the image.
+		//
+		// Set the members rather than assigning a temporary: Mesa has both added
+		// and removed members of this struct, so it reads bytes that are padding
+		// in this layout, and a copy from a temporary can carry that padding
+		// over. The object is zeroed above and stays that way.
+		wsiImageCreateInfo.sType = VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA;
+		wsiImageCreateInfo.pNext = std::exchange(imageInfo.pNext, &wsiImageCreateInfo);
+		wsiImageCreateInfo.scanout = VK_TRUE;
 	}
 	
 	if ( pDMA != nullptr )
@@ -2316,10 +2321,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 		if ( flags.bFlippable == true )
 		{
-			memory_wsi_info = {
-				.sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
-				.pNext = std::exchange(allocInfo.pNext, &memory_wsi_info),
-			};
+			// Member by member for the same reason as wsi_image_create_info
+			// above: the object is zeroed, and a copy from a temporary could
+			// carry that temporary's padding into bytes Mesa reads.
+			memory_wsi_info.sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA;
+			memory_wsi_info.pNext = std::exchange(allocInfo.pNext, &memory_wsi_info);
 		}
 
 		if ( flags.bExportable == true || pDMA != nullptr )
