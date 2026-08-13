@@ -75,3 +75,4 @@ bool pipewire_capture_frame_due(int nRefreshmHz);
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer);
 void push_pipewire_buffer(struct pipewire_buffer *buffer);
 void nudge_pipewire(void);
+void pipewire_set_capture_crop_size(uint32_t uWidth, uint32_t uHeight);
