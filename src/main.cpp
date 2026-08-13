@@ -721,6 +721,8 @@ void logind_sleep_init();
 
 int main(int argc, char **argv)
 {
+	signal( SIGPIPE, SIG_IGN );
+
 	g_argc = argc;
 	g_argv = argv;
 
