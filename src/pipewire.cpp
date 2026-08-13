@@ -44,6 +44,22 @@ static uint32_t s_nCaptureWidth;
 static uint32_t s_nCaptureHeight;
 static uint32_t s_nOutputWidth;
 static uint32_t s_nOutputHeight;
+// The size of the part of the output being captured when that is less than
+// the whole output, width in the high half; zero for the whole output.
+// steamcompmgr writes it, so this thread does not ask the backend for it.
+static std::atomic<uint64_t> s_ulCaptureCropSize;
+
+static void get_capture_source_size(uint32_t &uWidth, uint32_t &uHeight)
+{
+	const uint64_t ulCropSize = s_ulCaptureCropSize.load();
+	uWidth = uint32_t(ulCropSize >> 32);
+	uHeight = uint32_t(ulCropSize);
+	if (uWidth && uHeight)
+		return;
+
+	uWidth = g_nOutputWidth;
+	uHeight = g_nOutputHeight;
+}
 
 static void destroy_buffer(struct pipewire_buffer *buffer) {
 	assert(buffer->buffer == nullptr);
@@ -224,7 +240,9 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 
 	float *requested_size_scale = (float *) spa_buffer_find_meta_data(spa_buffer, SPA_META_requested_size_scale, sizeof(*requested_size_scale));
 	if (requested_size_scale != nullptr) {
-		*requested_size_scale = ((float)tex->width() / g_nOutputWidth);
+		uint32_t uSourceWidth, uSourceHeight;
+		get_capture_source_size(uSourceWidth, uSourceHeight);
+		*requested_size_scale = ((float)tex->width() / uSourceWidth);
 	}
 
 	struct spa_chunk *chunk = spa_buffer->datas[0].chunk;
@@ -297,9 +315,11 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
 		}
 	}
 
-	if (g_nOutputWidth != s_nOutputWidth || g_nOutputHeight != s_nOutputHeight) {
-		s_nOutputWidth = g_nOutputWidth;
-		s_nOutputHeight = g_nOutputHeight;
+	uint32_t uSourceWidth, uSourceHeight;
+	get_capture_source_size(uSourceWidth, uSourceHeight);
+	if (uSourceWidth != s_nOutputWidth || uSourceHeight != s_nOutputHeight) {
+		s_nOutputWidth = uSourceWidth;
+		s_nOutputHeight = uSourceHeight;
 		calculate_capture_size();
 	}
 	if (s_nCaptureWidth != state->video_info.size.width || s_nCaptureHeight != state->video_info.size.height) {
@@ -649,8 +669,7 @@ static bool connect_stream(struct pipewire_state *state)
 {
 	s_nRequestedWidth = 0;
 	s_nRequestedHeight = 0;
-	s_nOutputWidth = g_nOutputWidth;
-	s_nOutputHeight = g_nOutputHeight;
+	get_capture_source_size(s_nOutputWidth, s_nOutputHeight);
 	calculate_capture_size();
 	state->capture_interval_nanos.store(0);
 
@@ -882,4 +901,11 @@ void shutdown_pipewire(void)
 	// A thread stuck in PipeWire must not keep gamescope from exiting.
 	if (!s_ThreadExitCond.wait_for(lock, std::chrono::seconds(2), [] { return !s_bThreadRunning.load(); }))
 		pwr_log.errorf("the stream thread did not stop");
+}
+
+void pipewire_set_capture_crop_size(uint32_t uWidth, uint32_t uHeight)
+{
+	const uint64_t ulCropSize = uint64_t(uWidth) << 32 | uHeight;
+	if (s_ulCaptureCropSize.exchange(ulCropSize) != ulCropSize && s_bThreadRunning)
+		nudge_pipewire();
 }
