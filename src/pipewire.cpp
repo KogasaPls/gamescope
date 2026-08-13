@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "backend.h"
 #include "main.hpp"
 #include "pipewire.hpp"
 #include "log.hpp"
@@ -33,6 +34,15 @@ static uint32_t s_nCaptureWidth;
 static uint32_t s_nCaptureHeight;
 static uint32_t s_nOutputWidth;
 static uint32_t s_nOutputHeight;
+
+static void get_capture_source_size(uint32_t &uWidth, uint32_t &uHeight)
+{
+	if ( GetBackend() && GetBackend()->GetCaptureExtent( uWidth, uHeight ) )
+		return;
+
+	uWidth = g_nOutputWidth;
+	uHeight = g_nOutputHeight;
+}
 
 static void destroy_buffer(struct pipewire_buffer *buffer) {
 	assert(buffer->buffer == nullptr);
@@ -207,7 +217,9 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 
 	float *requested_size_scale = (float *) spa_buffer_find_meta_data(spa_buffer, SPA_META_requested_size_scale, sizeof(*requested_size_scale));
 	if (requested_size_scale != nullptr) {
-		*requested_size_scale = ((float)tex->width() / g_nOutputWidth);
+		uint32_t uSourceWidth, uSourceHeight;
+		get_capture_source_size(uSourceWidth, uSourceHeight);
+		*requested_size_scale = ((float)tex->width() / uSourceWidth);
 	}
 
 	struct spa_chunk *chunk = spa_buffer->datas[0].chunk;
@@ -280,9 +292,11 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
 		}
 	}
 
-	if (g_nOutputWidth != s_nOutputWidth || g_nOutputHeight != s_nOutputHeight) {
-		s_nOutputWidth = g_nOutputWidth;
-		s_nOutputHeight = g_nOutputHeight;
+	uint32_t uSourceWidth, uSourceHeight;
+	get_capture_source_size(uSourceWidth, uSourceHeight);
+	if (uSourceWidth != s_nOutputWidth || uSourceHeight != s_nOutputHeight) {
+		s_nOutputWidth = uSourceWidth;
+		s_nOutputHeight = uSourceHeight;
 		calculate_capture_size();
 	}
 	if (s_nCaptureWidth != state->video_info.size.width || s_nCaptureHeight != state->video_info.size.height) {
@@ -711,8 +725,7 @@ bool init_pipewire(void)
 
 	s_nRequestedWidth = 0;
 	s_nRequestedHeight = 0;
-	s_nOutputWidth = g_nOutputWidth;
-	s_nOutputHeight = g_nOutputHeight;
+	get_capture_source_size(s_nOutputWidth, s_nOutputHeight);
 	calculate_capture_size();
 
 	uint8_t buf[4096];
