@@ -195,6 +195,13 @@ extern std::atomic<std::shared_ptr<std::string>> focusWindow_engine;
 
 void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_server);
 void gamescope_set_selection(std::string contents, GamescopeSelection eSelection);
+// Same, for callers that already hold the wlserver lock; waylock is not
+// recursive. sMimeType names the encoding of contents, which the conversions
+// served from it are typed by.
+void gamescope_set_selection_locked(std::string contents, std::string sMimeType, GamescopeSelection eSelection);
+// Record the bytes a nested client copied, which a backend has published to
+// the host, and take the selection wherever no other client holds it.
+void gamescope_set_selection_contents(std::string contents, std::string sMimeType, GamescopeSelection eSelection);
 void gamescope_set_reshade_effect(std::string effect_path);
 void gamescope_clear_reshade_effect();
 
