@@ -8,6 +8,7 @@
 #include "Utils/Defer.h"
 #include "Utils/Algorithm.h"
 #include "app_viewport_helpers.hpp"
+#include "WaylandSelection.hpp"
 #include "convar.h"
 #include "refresh_rate.h"
 #include "waitable.h"
@@ -545,6 +546,7 @@ namespace gamescope
         virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override;
         virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) override;
         virtual void SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection ) override;
+        virtual void RevokeSelection( GamescopeSelection eSelection ) override;
     private:
 
         friend CWaylandPlane;
@@ -778,6 +780,7 @@ namespace gamescope
     {
     public:
         CWaylandBackend();
+        ~CWaylandBackend();
 
         /////////////
         // IBackend
@@ -1051,6 +1054,7 @@ namespace gamescope
         uint32_t m_uPointerEnterSerial = 0;
         CWaylandPlane *m_pCursorPlane = nullptr;
         uint32_t m_uKeyboardEnterSerial = 0;
+        CWaylandSelection m_Selection;
         bool m_bKeyboardEntered = false;
 
         uint32_t m_uGlobalFractionalScale = 120;
@@ -1630,6 +1634,9 @@ namespace gamescope
 
     void CWaylandConnector::SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection )
     {
+        if ( m_pBackend->m_Selection.SetSelection( szContents, eSelection, m_pBackend->m_bKeyboardEntered ) )
+            return;
+
         if ( m_pBackend->m_pDataDeviceManager && !m_pBackend->m_pDataDevice )
             m_pBackend->m_pDataDevice = wl_data_device_manager_get_data_device( m_pBackend->m_pDataDeviceManager, m_pBackend->m_pSeat );
 
@@ -1641,11 +1648,8 @@ namespace gamescope
             m_pBackend->m_pClipboard = szContents;
             wl_data_source *source = wl_data_device_manager_create_data_source( m_pBackend->m_pDataDeviceManager );
             wl_data_source_add_listener( source, &m_pBackend->s_DataSourceListener, m_pBackend );
-            wl_data_source_offer( source, "text/plain" );
-            wl_data_source_offer( source, "text/plain;charset=utf-8" );
-            wl_data_source_offer( source, "TEXT" );
-            wl_data_source_offer( source, "STRING" );
-            wl_data_source_offer( source, "UTF8_STRING" );
+            for ( const char *pMime : wayland_selection::OutboundMimeTypes( szContents ? std::string_view( *szContents ) : std::string_view{} ) )
+                wl_data_source_offer( source, pMime );
             wl_data_device_set_selection( m_pBackend->m_pDataDevice, source, m_pBackend->m_uKeyboardEnterSerial );
         }
         else if ( eSelection == GAMESCOPE_SELECTION_PRIMARY && m_pBackend->m_pPrimarySelectionDevice )
@@ -1653,13 +1657,21 @@ namespace gamescope
             m_pBackend->m_pPrimarySelection = szContents;
             zwp_primary_selection_source_v1 *source = zwp_primary_selection_device_manager_v1_create_source( m_pBackend->m_pPrimarySelectionDeviceManager );
             zwp_primary_selection_source_v1_add_listener( source, &m_pBackend->s_PrimarySelectionSourceListener, m_pBackend );
-            zwp_primary_selection_source_v1_offer( source, "text/plain" );
-            zwp_primary_selection_source_v1_offer( source, "text/plain;charset=utf-8" );
-            zwp_primary_selection_source_v1_offer( source, "TEXT" );
-            zwp_primary_selection_source_v1_offer( source, "STRING" );
-            zwp_primary_selection_source_v1_offer( source, "UTF8_STRING" );
+            for ( const char *pMime : wayland_selection::OutboundMimeTypes( szContents ? std::string_view( *szContents ) : std::string_view{} ) )
+                zwp_primary_selection_source_v1_offer( source, pMime );
             zwp_primary_selection_device_v1_set_selection( m_pBackend->m_pPrimarySelectionDevice, source, m_pBackend->m_uPointerEnterSerial );
         }
+    }
+
+    void CWaylandConnector::RevokeSelection( GamescopeSelection eSelection )
+    {
+        m_pBackend->m_Selection.RevokeSelection( eSelection );
+        // Seat requests can be rejected without a cancellation event. An
+        // older source may still be active; all of them read this payload.
+        if ( eSelection == GAMESCOPE_SELECTION_CLIPBOARD )
+            m_pBackend->m_pClipboard.reset();
+        else
+            m_pBackend->m_pPrimarySelection.reset();
     }
 
     //////////////////
@@ -2500,6 +2512,11 @@ namespace gamescope
     {
     }
 
+    CWaylandBackend::~CWaylandBackend()
+    {
+        m_Selection.Shutdown();
+    }
+
     bool CWaylandBackend::Init()
     {
         g_nOutputWidth = g_nPreferredOutputWidth;
@@ -2608,6 +2625,8 @@ namespace gamescope
             xdg_log.errorf( "Failed to initialize input thread" );
             return false;
         }
+
+        m_Selection.Init( m_pDisplay, m_pSeat );
 
         xdg_log.infof( "Initted Wayland backend" );
 
@@ -3110,6 +3129,8 @@ namespace gamescope
 
     void CWaylandBackend::Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion )
     {
+        m_Selection.BindGlobal( pRegistry, uName, pInterface, uVersion );
+
         if ( !strcmp( pInterface, wl_compositor_interface.name ) && uVersion >= 4u )
         {
             m_pCompositor = (wl_compositor *)wl_registry_bind( pRegistry, uName, &wl_compositor_interface, 4u );
@@ -3328,6 +3349,8 @@ namespace gamescope
         m_uKeyboardEnterSerial = uSerial;
         m_bKeyboardEntered = true;
 
+        m_Selection.PublishPendingSelections();
+
         UpdateCursor();
     }
     void CWaylandBackend::Wayland_Keyboard_Leave( wl_keyboard *pKeyboard, uint32_t uSerial, wl_surface *pSurface )
@@ -3458,6 +3481,11 @@ namespace gamescope
 
     void CWaylandBackend::Wayland_DataSource_Send( struct wl_data_source *pSource, const char *pMime, int nFd )
     {
+        if ( !m_pClipboard || !wayland_selection::CanSendUtf8( pMime, *m_pClipboard ) )
+        {
+            close( nFd );
+            return;
+        }
         ssize_t len = m_pClipboard->length();
         if ( write( nFd, m_pClipboard->c_str(), len ) != len )
             xdg_log.infof( "Failed to write all %zd bytes to clipboard", len );
@@ -3472,7 +3500,12 @@ namespace gamescope
 
     void CWaylandBackend::Wayland_PrimarySelectionSource_Send( struct zwp_primary_selection_source_v1 *pSource, const char *pMime, int nFd )
     {
-	ssize_t len = m_pPrimarySelection->length();
+        if ( !m_pPrimarySelection || !wayland_selection::CanSendUtf8( pMime, *m_pPrimarySelection ) )
+        {
+            close( nFd );
+            return;
+        }
+        ssize_t len = m_pPrimarySelection->length();
         if ( write( nFd, m_pPrimarySelection->c_str(), len ) != len )
 	    xdg_log.infof( "Failed to write all %zd bytes to clipboard", len );
         close( nFd );
