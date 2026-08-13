@@ -3255,7 +3255,10 @@ namespace gamescope
         m_pXkbKeymap = pKeymap;
 
         for ( uint32_t i = 0; i < GAMESCOPE_WAYLAND_MOD_COUNT; i++ )
-            m_uModMask[ i ] = 1u << xkb_keymap_mod_get_index( m_pXkbKeymap, WaylandModifierToXkbModifierName( ( WaylandModifierIndex ) i ) );
+        {
+            const xkb_mod_index_t uIndex = xkb_keymap_mod_get_index( m_pXkbKeymap, WaylandModifierToXkbModifierName( ( WaylandModifierIndex ) i ) );
+            m_uModMask[ i ] = uIndex == XKB_MOD_INVALID ? 0u : ( 1u << uIndex );
+        }
     }
     void CWaylandInputThread::Wayland_Keyboard_Enter( wl_keyboard *pKeyboard, uint32_t uSerial, wl_surface *pSurface, wl_array *pKeys )
     {
@@ -3291,6 +3294,13 @@ namespace gamescope
         m_bKeyboardEntered = false;
         m_uKeyModifiers = 0;
 
+        // Clear the group keyboard's modifiers too, symmetric with the
+        // scancode release below: without this it keeps whatever mods were
+        // down when the host stole focus until the next host modifier event.
+        wlserver_lock();
+        wlserver_modifiers( 0, 0, 0, 0 );
+        wlserver_unlock();
+
         for ( uint32_t uKey : m_uScancodesHeld )
             HandleKey( uKey, false );
 
@@ -3316,6 +3326,10 @@ namespace gamescope
     void CWaylandInputThread::Wayland_Keyboard_Modifiers( wl_keyboard *pKeyboard, uint32_t uSerial, uint32_t uModsDepressed, uint32_t uModsLatched, uint32_t uModsLocked, uint32_t uGroup )
     {
         m_uKeyModifiers = uModsDepressed | uModsLatched | uModsLocked;
+
+        wlserver_lock();
+        wlserver_modifiers( uModsDepressed, uModsLatched, uModsLocked, uGroup );
+        wlserver_unlock();
     }
     void CWaylandInputThread::Wayland_Keyboard_RepeatInfo( wl_keyboard *pKeyboard, int32_t nRate, int32_t nDelay )
     {
