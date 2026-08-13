@@ -1137,7 +1137,7 @@ namespace gamescope
                 oApp = LayerRect( pFrameInfo->layers.get( nAppLayer ) );
         }
 
-        const app_viewport::Rect output{ 0, 0, g_nOutputWidth, g_nOutputHeight };
+        const app_viewport::Rect output{ 0, 0, uint32_t( g_nOutputWidth ), uint32_t( g_nOutputHeight ) };
         const app_viewport::Rect viewport = app_viewport::ComputeViewport( oApp, output.uWidth, output.uHeight );
         // A host-dictated resize moves the output without moving the viewport,
         // so this is settled before the unchanged-viewport early return.

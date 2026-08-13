@@ -3179,7 +3179,7 @@ bool vulkan_supports_hdr10()
 	return false;
 }
 
-extern bool g_bOutputHDREnabled;
+extern std::atomic< bool > g_bOutputHDREnabled;
 
 bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 {
