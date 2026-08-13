@@ -99,7 +99,7 @@ namespace gamescope
 
 	int CVBlankTimer::GetRefresh() const
 	{
-		return g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+		return g_nNestedRefresh ? int( g_nNestedRefresh ) : int( g_nOutputRefresh );
 	}
 
 	uint64_t CVBlankTimer::GetLastVBlank() const
@@ -142,7 +142,7 @@ namespace gamescope
 
 		// SDL changes the override on focus events; use one snapshot for rate and policy.
 		const int nNestedRefresh = g_nNestedRefresh;
-		const int nRefreshRate = nNestedRefresh ? nNestedRefresh : g_nOutputRefresh;
+		const int nRefreshRate = nNestedRefresh ? nNestedRefresh : int( g_nOutputRefresh );
 		const uint64_t ulRefreshInterval = mHzToRefreshCycle( nRefreshRate );
 
 		bool bVRR = GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive();
@@ -405,7 +405,7 @@ namespace gamescope
 				const int nNestedRefresh = g_nNestedRefresh;
 				const uint64_t ulTargetFloor = VBlank::TargetFloor( m_LastVBlankSchedule,
 				{
-					.ulInterval = mHzToRefreshCycle( nNestedRefresh ? nNestedRefresh : g_nOutputRefresh ),
+					.ulInterval = mHzToRefreshCycle( nNestedRefresh ? nNestedRefresh : int( g_nOutputRefresh ) ),
 					.bVRR = bVRR,
 					.bRateOverride = GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0,
 				} );
@@ -468,7 +468,7 @@ namespace gamescope
 			else
 			{
 				// If we don't currently have a connector, make up some dummy refresh cycle.
-				sleep_for_nanos( mHzToRefreshCycle( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh ) );
+				sleep_for_nanos( mHzToRefreshCycle( g_nNestedRefresh ? int( g_nNestedRefresh ) : int( g_nOutputRefresh ) ) );
         		uint64_t ulNow = get_time_in_nanos();
 				schedule = VBlankScheduleTime
 				{
