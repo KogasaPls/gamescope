@@ -8,6 +8,7 @@
 #include "Utils/Defer.h"
 #include "Utils/Algorithm.h"
 #include "app_viewport_helpers.hpp"
+#include "WaylandSelection.hpp"
 #include "convar.h"
 #include "refresh_rate.h"
 #include "waitable.h"
@@ -37,7 +38,6 @@
 #include <color-management-v1-client-protocol.h>
 #include <pointer-constraints-unstable-v1-client-protocol.h>
 #include <relative-pointer-unstable-v1-client-protocol.h>
-#include <primary-selection-unstable-v1-client-protocol.h>
 #include <fractional-scale-v1-client-protocol.h>
 #include <tearing-control-v1-client-protocol.h>
 #include <content-type-v1-client-protocol.h>
@@ -770,6 +770,7 @@ namespace gamescope
     {
     public:
         CWaylandBackend();
+        ~CWaylandBackend();
 
         /////////////
         // IBackend
@@ -952,14 +953,6 @@ namespace gamescope
         void Wayland_WPColorManager_ColorManagerDone( wp_color_manager_v1 *pWPColorManager );
         static const wp_color_manager_v1_listener s_WPColorManagerListener;
 
-        void Wayland_DataSource_Send( struct wl_data_source *pSource, const char *pMime, int nFd );
-        void Wayland_DataSource_Cancelled( struct wl_data_source *pSource );
-        static const wl_data_source_listener s_DataSourceListener;
-
-        void Wayland_PrimarySelectionSource_Send( struct zwp_primary_selection_source_v1 *pSource, const char *pMime, int nFd );
-        void Wayland_PrimarySelectionSource_Cancelled( struct zwp_primary_selection_source_v1 *pSource );
-        static const zwp_primary_selection_source_v1_listener s_PrimarySelectionSourceListener;
-
         CWaylandInputThread m_InputThread;
 
         wl_display *m_pDisplay = nullptr;
@@ -992,14 +985,6 @@ namespace gamescope
         std::atomic<uint32_t> m_uCaptureWidth = { 0 };
         std::atomic<uint32_t> m_uCaptureHeight = { 0 };
 
-        wl_data_device_manager *m_pDataDeviceManager = nullptr;
-        wl_data_device *m_pDataDevice = nullptr;
-        std::shared_ptr<std::string> m_pClipboard = nullptr;
-
-        zwp_primary_selection_device_manager_v1 *m_pPrimarySelectionDeviceManager = nullptr;
-        zwp_primary_selection_device_v1 *m_pPrimarySelectionDevice = nullptr;
-        std::shared_ptr<std::string> m_pPrimarySelection = nullptr;
-
         struct
         {
             std::vector<wp_color_manager_v1_primaries> ePrimaries;
@@ -1030,7 +1015,8 @@ namespace gamescope
 
         uint32_t m_uPointerEnterSerial = 0;
         bool m_bMouseEntered = false;
-        uint32_t m_uKeyboardEnterSerial = 0;
+        void NoteInputSerial( uint32_t uSerial ) { m_Selection.NoteInputSerial( uSerial ); }
+        CWaylandSelection m_Selection;
         bool m_bKeyboardEntered = false;
 
         std::shared_ptr<INestedHints::CursorInfo> m_pCursorInfo;
@@ -1093,21 +1079,6 @@ namespace gamescope
         .supported_primaries_named = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WPColorManager_SupportedPrimariesNamed ),
         .done        = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WPColorManager_ColorManagerDone ),
     };
-    const wl_data_source_listener CWaylandBackend::s_DataSourceListener =
-    {
-        .target             = WAYLAND_NULL(),
-        .send               = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataSource_Send ),
-        .cancelled          = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataSource_Cancelled ),
-        .dnd_drop_performed = WAYLAND_NULL(),
-        .dnd_finished       = WAYLAND_NULL(),
-        .action             = WAYLAND_NULL(),
-    };
-    const zwp_primary_selection_source_v1_listener CWaylandBackend::s_PrimarySelectionSourceListener =
-    {
-        .send      = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_PrimarySelectionSource_Send ),
-        .cancelled = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_PrimarySelectionSource_Cancelled ),
-    };
-
     //////////////////
     // CWaylandFb
     //////////////////
@@ -1644,36 +1615,7 @@ namespace gamescope
 
     void CWaylandConnector::SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection )
     {
-        if ( m_pBackend->m_pDataDeviceManager && !m_pBackend->m_pDataDevice )
-            m_pBackend->m_pDataDevice = wl_data_device_manager_get_data_device( m_pBackend->m_pDataDeviceManager, m_pBackend->m_pSeat );
-
-        if ( m_pBackend->m_pPrimarySelectionDeviceManager && !m_pBackend->m_pPrimarySelectionDevice )
-            m_pBackend->m_pPrimarySelectionDevice = zwp_primary_selection_device_manager_v1_get_device( m_pBackend->m_pPrimarySelectionDeviceManager, m_pBackend->m_pSeat );
-
-        if ( eSelection == GAMESCOPE_SELECTION_CLIPBOARD && m_pBackend->m_pDataDevice )
-        {
-            m_pBackend->m_pClipboard = szContents;
-            wl_data_source *source = wl_data_device_manager_create_data_source( m_pBackend->m_pDataDeviceManager );
-            wl_data_source_add_listener( source, &m_pBackend->s_DataSourceListener, m_pBackend );
-            wl_data_source_offer( source, "text/plain" );
-            wl_data_source_offer( source, "text/plain;charset=utf-8" );
-            wl_data_source_offer( source, "TEXT" );
-            wl_data_source_offer( source, "STRING" );
-            wl_data_source_offer( source, "UTF8_STRING" );
-            wl_data_device_set_selection( m_pBackend->m_pDataDevice, source, m_pBackend->m_uKeyboardEnterSerial );
-        }
-        else if ( eSelection == GAMESCOPE_SELECTION_PRIMARY && m_pBackend->m_pPrimarySelectionDevice )
-        {
-            m_pBackend->m_pPrimarySelection = szContents;
-            zwp_primary_selection_source_v1 *source = zwp_primary_selection_device_manager_v1_create_source( m_pBackend->m_pPrimarySelectionDeviceManager );
-            zwp_primary_selection_source_v1_add_listener( source, &m_pBackend->s_PrimarySelectionSourceListener, m_pBackend );
-            zwp_primary_selection_source_v1_offer( source, "text/plain" );
-            zwp_primary_selection_source_v1_offer( source, "text/plain;charset=utf-8" );
-            zwp_primary_selection_source_v1_offer( source, "TEXT" );
-            zwp_primary_selection_source_v1_offer( source, "STRING" );
-            zwp_primary_selection_source_v1_offer( source, "UTF8_STRING" );
-            zwp_primary_selection_device_v1_set_selection( m_pBackend->m_pPrimarySelectionDevice, source, m_pBackend->m_uPointerEnterSerial );
-        }
+        m_pBackend->m_Selection.SetSelection( std::move( szContents ), eSelection, m_pBackend->m_bKeyboardEntered );
     }
 
     //////////////////
@@ -2494,6 +2436,11 @@ namespace gamescope
     {
     }
 
+    CWaylandBackend::~CWaylandBackend()
+    {
+        m_Selection.Shutdown();
+    }
+
     bool CWaylandBackend::Init()
     {
         g_nOutputWidth = g_nPreferredOutputWidth;
@@ -2600,6 +2547,8 @@ namespace gamescope
             xdg_log.errorf( "Failed to initialize input thread" );
             return false;
         }
+
+        m_Selection.Init( m_pDisplay, m_pSeat );
 
         xdg_log.infof( "Initted Wayland backend" );
 
@@ -3028,6 +2977,8 @@ namespace gamescope
 
     void CWaylandBackend::Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion )
     {
+        m_Selection.BindGlobal( pRegistry, uName, pInterface, uVersion );
+
         if ( !strcmp( pInterface, wl_compositor_interface.name ) && uVersion >= 4u )
         {
             m_pCompositor = (wl_compositor *)wl_registry_bind( pRegistry, uName, &wl_compositor_interface, 4u );
@@ -3118,14 +3069,7 @@ namespace gamescope
         {
             m_pToplevelIconManager = (xdg_toplevel_icon_manager_v1 *)wl_registry_bind( pRegistry, uName, &xdg_toplevel_icon_manager_v1_interface, 1u );
         }
-        else if ( !strcmp( pInterface, wl_data_device_manager_interface.name ) )
-        {
-            m_pDataDeviceManager = (wl_data_device_manager *)wl_registry_bind( pRegistry, uName, &wl_data_device_manager_interface, 3u );
-        }
-        else if ( !strcmp( pInterface, zwp_primary_selection_device_manager_v1_interface.name ) )
-        {
-            m_pPrimarySelectionDeviceManager = (zwp_primary_selection_device_manager_v1 *)wl_registry_bind( pRegistry, uName, &zwp_primary_selection_device_manager_v1_interface, 1u );
-        }
+
     }
 
     void CWaylandBackend::Wayland_Modifier( zwp_linux_dmabuf_v1 *pDmabuf, uint32_t uFormat, uint32_t uModifierHi, uint32_t uModifierLo )
@@ -3238,8 +3182,10 @@ namespace gamescope
 		if ( !IsGamescopeToplevel( pSurface ) )
 			return;
 
-        m_uKeyboardEnterSerial = uSerial;
+        NoteInputSerial( uSerial );
         m_bKeyboardEntered = true;
+
+        m_Selection.PublishPendingSelections();
 
         UpdateCursor();
     }
@@ -3285,34 +3231,6 @@ namespace gamescope
     void CWaylandBackend::Wayland_WPColorManager_ColorManagerDone( wp_color_manager_v1 *pWPColorManager )
     {
 
-    }
-
-    // Data Source
-
-    void CWaylandBackend::Wayland_DataSource_Send( struct wl_data_source *pSource, const char *pMime, int nFd )
-    {
-        ssize_t len = m_pClipboard->length();
-        if ( write( nFd, m_pClipboard->c_str(), len ) != len )
-            xdg_log.infof( "Failed to write all %zd bytes to clipboard", len );
-        close( nFd );
-    }
-    void CWaylandBackend::Wayland_DataSource_Cancelled( struct wl_data_source *pSource )
-    {
-        wl_data_source_destroy( pSource );
-    }
-
-    // Primary Selection Source
-
-    void CWaylandBackend::Wayland_PrimarySelectionSource_Send( struct zwp_primary_selection_source_v1 *pSource, const char *pMime, int nFd )
-    {
-	ssize_t len = m_pPrimarySelection->length();
-        if ( write( nFd, m_pPrimarySelection->c_str(), len ) != len )
-	    xdg_log.infof( "Failed to write all %zd bytes to clipboard", len );
-        close( nFd );
-    }
-    void CWaylandBackend::Wayland_PrimarySelectionSource_Cancelled( struct zwp_primary_selection_source_v1 *pSource)
-    {
-        zwp_primary_selection_source_v1_destroy( pSource );
     }
 
     ///////////////////////
@@ -3775,6 +3693,8 @@ namespace gamescope
     }
     void CWaylandInputThread::Wayland_Pointer_Button( wl_pointer *pPointer, uint32_t uSerial, uint32_t uTime, uint32_t uButton, uint32_t uState )
     {
+        m_pBackend->NoteInputSerial( uSerial );
+
         // Ignore any pointer events for which the `enter` event surface didn't pass `IsGamescopeToplevel` (libdecor frame)
         if ( !m_bMouseEntered )
             return;
@@ -3908,6 +3828,8 @@ namespace gamescope
     }
     void CWaylandInputThread::Wayland_Keyboard_Key( wl_keyboard *pKeyboard, uint32_t uSerial, uint32_t uTime, uint32_t uKey, uint32_t uState )
     {
+        m_pBackend->NoteInputSerial( uSerial );
+
         if ( !m_bKeyboardEntered )
             return;
 
