@@ -3328,15 +3328,10 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	outputImageflags.bSampled = true; // for pipewire blits
 	outputImageflags.bOutputImage = true;
 
-	pOutput->outputImages.resize(3); // extra image for partial composition.
-	pOutput->outputImagesPartialOverlay.resize(3);
+	pOutput->uRingSize = GetBackend() ? GetBackend()->GetOutputRingDepth() : 3;
 
-	pOutput->outputImages[0] = nullptr;
-	pOutput->outputImages[1] = nullptr;
-	pOutput->outputImages[2] = nullptr;
-	pOutput->outputImagesPartialOverlay[0] = nullptr;
-	pOutput->outputImagesPartialOverlay[1] = nullptr;
-	pOutput->outputImagesPartialOverlay[2] = nullptr;
+	pOutput->outputImages.assign(pOutput->uRingSize, nullptr); // extra image for partial composition.
+	pOutput->outputImagesPartialOverlay.assign(pOutput->uRingSize, nullptr);
 
 	uint32_t uDRMFormat = pOutput->uOutputFormat;
 
@@ -3346,28 +3341,14 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	if ( g_uOutputRotation & 1u )
 		std::swap( uOutputWidth, uOutputHeight );
 
-	pOutput->outputImages[0] = new CVulkanTexture();
-	bool bSuccess = pOutput->outputImages[0]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags );
-	if ( bSuccess != true )
+	for ( uint32_t i = 0; i < pOutput->uRingSize; i++ )
 	{
-		vk_log.errorf( "failed to allocate buffer for KMS" );
-		return false;
-	}
-
-	pOutput->outputImages[1] = new CVulkanTexture();
-	bSuccess = pOutput->outputImages[1]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags );
-	if ( bSuccess != true )
-	{
-		vk_log.errorf( "failed to allocate buffer for KMS" );
-		return false;
-	}
-
-	pOutput->outputImages[2] = new CVulkanTexture();
-	bSuccess = pOutput->outputImages[2]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags );
-	if ( bSuccess != true )
-	{
-		vk_log.errorf( "failed to allocate buffer for KMS" );
-		return false;
+		pOutput->outputImages[i] = new CVulkanTexture();
+		if ( !pOutput->outputImages[i]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags ) )
+		{
+			vk_log.errorf( "failed to allocate buffer for KMS" );
+			return false;
+		}
 	}
 
 	// Oh no.
@@ -3377,28 +3358,14 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	{
 		uint32_t uPartialDRMFormat = pOutput->uOutputFormatOverlay;
 
-		pOutput->outputImagesPartialOverlay[0] = new CVulkanTexture();
-		bool bSuccess = pOutput->outputImagesPartialOverlay[0]->BInit( uOutputWidth, uOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[0].get() );
-		if ( bSuccess != true )
+		for ( uint32_t i = 0; i < pOutput->uRingSize; i++ )
 		{
-			vk_log.errorf( "failed to allocate buffer for KMS" );
-			return false;
-		}
-
-		pOutput->outputImagesPartialOverlay[1] = new CVulkanTexture();
-		bSuccess = pOutput->outputImagesPartialOverlay[1]->BInit( uOutputWidth, uOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[1].get() );
-		if ( bSuccess != true )
-		{
-			vk_log.errorf( "failed to allocate buffer for KMS" );
-			return false;
-		}
-
-		pOutput->outputImagesPartialOverlay[2] = new CVulkanTexture();
-		bSuccess = pOutput->outputImagesPartialOverlay[2]->BInit( uOutputWidth, uOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[2].get() );
-		if ( bSuccess != true )
-		{
-			vk_log.errorf( "failed to allocate buffer for KMS" );
-			return false;
+			pOutput->outputImagesPartialOverlay[i] = new CVulkanTexture();
+			if ( !pOutput->outputImagesPartialOverlay[i]->BInit( uOutputWidth, uOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[i].get() ) )
+			{
+				vk_log.errorf( "failed to allocate buffer for KMS" );
+				return false;
+			}
 		}
 	}
 
@@ -3436,6 +3403,8 @@ bool vulkan_remake_output_images()
 	g_device.waitIdle();
 
 	pOutput->nOutImage = 0;
+	pOutput->uLastComposited[0] = 0;
+	pOutput->uLastComposited[1] = 0;
 
 	// Delete screenshot/capture textures to be remade if needed
 	for (auto& pScreenshotTexture : pOutput->pScreenshotTextures)
@@ -4330,7 +4299,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
 	{
-		g_output.nOutImage = ( g_output.nOutImage + 1 ) % 3;
+		g_output.uLastComposited[1] = g_output.uLastComposited[0];
+		g_output.uLastComposited[0] = g_output.nOutImage;
+		g_output.nOutImage = ( g_output.nOutImage + 1 ) % g_output.uRingSize;
 	}
 
 	return sequence;
@@ -4383,19 +4354,35 @@ bool vulkan_has_drm_modifiers_for_features(VkFormat format, VkFormatFeatureFlags
 
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer )
 {
-	// Get previous image ( +2 )
-	// 1 2 3
-	//   |
-	// |
-	uint32_t nRegularImage = ( g_output.nOutImage + 2 ) % 3;
+	uint32_t nOutImage;
+	if ( GetBackend()->UsesVulkanSwapchain() )
+	{
+		// nOutImage comes from AcquireNextImageKHR here, and uRingSize is not the
+		// swapchain's image count, so these lookbacks are upstream's modulo
+		// arithmetic unchanged. No caller of this function uses a swapchain.
+		const uint32_t uRingSize = g_output.uRingSize;
 
-	// Get previous previous image ( +1 )
-	// 1 2 3
-	//   |
-	//     |
-	uint32_t nDeferredImage = ( g_output.nOutImage + 1 ) % 3;
+		// Get previous image ( -1 )
+		// 1 2 3
+		//   |
+		// |
+		uint32_t nRegularImage = ( g_output.nOutImage + uRingSize - 1 ) % uRingSize;
 
-	uint32_t nOutImage = defer ? nDeferredImage : nRegularImage;
+		// Get previous previous image ( -2 )
+		// 1 2 3
+		//   |
+		//     |
+		uint32_t nDeferredImage = ( g_output.nOutImage + uRingSize - 2 ) % uRingSize;
+
+		nOutImage = defer ? nDeferredImage : nRegularImage;
+	}
+	else
+	{
+		// The output ring gate can rotate the cursor onto a free slot before
+		// a composite, so cursor-derived lookbacks can name a slot that was
+		// never composited. Read the recorded slots instead.
+		nOutImage = g_output.uLastComposited[ defer ? 1 : 0 ];
+	}
 
 	if ( partial )
 	{
@@ -4406,6 +4393,43 @@ gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool d
 
 
 	return g_output.outputImages[ nOutImage ];
+}
+
+bool vulkan_output_ring_rotate_to_free_slot( void )
+{
+	VulkanOutput_t *pOutput = &g_output;
+	const uint32_t uRingSize = pOutput->uRingSize;
+
+	// A slot with no image behind it is one that vulkan_ensure_output_images()
+	// has yet to make on the first composite: the host cannot hold what does
+	// not exist. The partial-overlay image is a second view onto the same
+	// memory as its regular sibling, so a hold on either holds the slot.
+	auto SlotHeld = [ pOutput ]( uint32_t uSlot ) -> bool
+	{
+		bool bHeld = false;
+		if ( uSlot < pOutput->outputImages.size() && pOutput->outputImages[uSlot] != nullptr )
+		{
+			gamescope::IBackendFb *pFb = pOutput->outputImages[uSlot]->GetBackendFb();
+			bHeld |= pFb != nullptr && pFb->IsHeldByCompositor();
+		}
+		if ( uSlot < pOutput->outputImagesPartialOverlay.size() && pOutput->outputImagesPartialOverlay[uSlot] != nullptr )
+		{
+			gamescope::IBackendFb *pFb = pOutput->outputImagesPartialOverlay[uSlot]->GetBackendFb();
+			bHeld |= pFb != nullptr && pFb->IsHeldByCompositor();
+		}
+		return bHeld;
+	};
+
+	for ( uint32_t i = 0; i < uRingSize; i++ )
+	{
+		const uint32_t uSlot = ( pOutput->nOutImage + i ) % uRingSize;
+		if ( !SlotHeld( uSlot ) )
+		{
+			pOutput->nOutImage = uSlot;
+			return true;
+		}
+	}
+	return false;
 }
 
 bool vulkan_primary_dev_id(dev_t *id)
