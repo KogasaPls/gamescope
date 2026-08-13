@@ -8,6 +8,7 @@
 #include "Utils/Defer.h"
 #include "Utils/Algorithm.h"
 #include "app_viewport_helpers.hpp"
+#include "wayland_selection_helpers.hpp"
 #include "convar.h"
 #include "refresh_rate.h"
 #include "waitable.h"
@@ -37,6 +38,8 @@
 #include <pointer-constraints-unstable-v1-client-protocol.h>
 #include <relative-pointer-unstable-v1-client-protocol.h>
 #include <primary-selection-unstable-v1-client-protocol.h>
+#include <ext-data-control-v1-client-protocol.h>
+#include <wlr-data-control-unstable-v1-client-protocol.h>
 #include <fractional-scale-v1-client-protocol.h>
 #include <tearing-control-v1-client-protocol.h>
 #include <content-type-v1-client-protocol.h>
@@ -45,6 +48,9 @@
 
 #include "drm_include.h"
 
+#include <fcntl.h>
+#include <functional>
+#include <poll.h>
 #include <cinttypes>
 
 extern int g_nPreferredOutputWidth;
@@ -526,7 +532,12 @@ namespace gamescope
         virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override;
         virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) override;
         virtual void SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection ) override;
+        virtual bool FetchHostSelection( GamescopeSelection eSelection, const char *pszMimeType, uint64_t ulEpoch ) override;
+        virtual bool GetHostSelectionMimeTypes( GamescopeSelection eSelection, std::vector<std::string> &mimeTypes ) override;
     private:
+
+        template <typename Protocol>
+        void SetSelectionFor( GamescopeSelection eSelection );
 
         friend CWaylandPlane;
 
@@ -720,6 +731,7 @@ namespace gamescope
     {
     public:
         CWaylandBackend();
+        ~CWaylandBackend();
 
         /////////////
         // IBackend
@@ -884,13 +896,124 @@ namespace gamescope
         void Wayland_WPColorManager_ColorManagerDone( wp_color_manager_v1 *pWPColorManager );
         static const wp_color_manager_v1_listener s_WPColorManagerListener;
 
-        void Wayland_DataSource_Send( struct wl_data_source *pSource, const char *pMime, int nFd );
-        void Wayland_DataSource_Cancelled( struct wl_data_source *pSource );
-        static const wl_data_source_listener s_DataSourceListener;
+        // Upper bound on a single incoming selection transfer.
+        static constexpr size_t k_uMaxSelectionSize = 4 * 1024 * 1024;
 
-        void Wayland_PrimarySelectionSource_Send( struct zwp_primary_selection_source_v1 *pSource, const char *pMime, int nFd );
-        void Wayland_PrimarySelectionSource_Cancelled( struct zwp_primary_selection_source_v1 *pSource );
-        static const zwp_primary_selection_source_v1_listener s_PrimarySelectionSourceListener;
+        // Which host protocol carries selections. A data control device takes
+        // no serial, is not gated on keyboard focus and sends the current
+        // selection at bind, so it can carry both directions; the seat device
+        // can only be trusted with the inbound one.
+        // X11's None is a macro here, hence Unavailable.
+        enum class SelectionTransport
+        {
+            Unavailable,
+            ExtDataControl,
+            WlrDataControl,
+            Seat,
+        };
+        SelectionTransport m_eSelectionTransport = SelectionTransport::Unavailable;
+
+        // Host-to-client clipboard: receive the host compositor's CLIPBOARD
+        // selection and forward it to the nested gamescope session.
+        void Wayland_DataDevice_DataOffer( struct wl_data_device *pDevice, struct wl_data_offer *pOffer );
+        void Wayland_DataDevice_Selection( wl_data_device *pDataDevice, wl_data_offer *pOffer );
+        // Declines drag-and-drop offers; the same offer objects are also used for selections.
+        void Wayland_DataDevice_Enter( wl_data_device *pDataDevice, uint32_t uSerial, wl_surface *pSurface, wl_fixed_t x, wl_fixed_t y, wl_data_offer *pOffer );
+        void Wayland_DataDevice_Leave( wl_data_device *pDataDevice );
+        void Wayland_DataDevice_Drop( wl_data_device *pDataDevice );
+        static const wl_data_device_listener s_DataDeviceListener;
+
+        static void Wayland_DataOffer_Offer( void *pData, struct wl_data_offer *pOffer, const char *pMime );
+        static const wl_data_offer_listener s_DataOfferListener;
+
+        // Host-to-client primary selection: same again for the PRIMARY selection
+        // (middle-click paste).
+        void Wayland_PrimarySelectionDevice_DataOffer( struct zwp_primary_selection_device_v1 *pDevice, struct zwp_primary_selection_offer_v1 *pOffer );
+        void Wayland_PrimarySelectionDevice_Selection( zwp_primary_selection_device_v1 *pDevice, zwp_primary_selection_offer_v1 *pOffer );
+        static const zwp_primary_selection_device_v1_listener s_PrimarySelectionDeviceListener;
+
+        static void Wayland_PrimarySelectionOffer_Offer( void *pData, struct zwp_primary_selection_offer_v1 *pOffer, const char *pMime );
+        static const zwp_primary_selection_offer_v1_listener s_PrimarySelectionOfferListener;
+
+        // Selections over ext-data-control-v1: one device carries both
+        // selections in both directions.
+        void Wayland_ExtDataControlDevice_DataOffer( ext_data_control_device_v1 *pDevice, ext_data_control_offer_v1 *pOffer );
+        void Wayland_ExtDataControlDevice_Selection( ext_data_control_device_v1 *pDevice, ext_data_control_offer_v1 *pOffer );
+        void Wayland_ExtDataControlDevice_Finished( ext_data_control_device_v1 *pDevice );
+        void Wayland_ExtDataControlDevice_PrimarySelection( ext_data_control_device_v1 *pDevice, ext_data_control_offer_v1 *pOffer );
+        static const ext_data_control_device_v1_listener s_ExtDataControlDeviceListener;
+
+        static void Wayland_ExtDataControlOffer_Offer( void *pData, ext_data_control_offer_v1 *pOffer, const char *pMime );
+        static const ext_data_control_offer_v1_listener s_ExtDataControlOfferListener;
+
+        void Wayland_ExtDataControlSource_Send( ext_data_control_source_v1 *pSource, const char *pMime, int nFd );
+        void Wayland_ExtDataControlSource_Cancelled( ext_data_control_source_v1 *pSource );
+        static const ext_data_control_source_v1_listener s_ExtDataControlSourceListener;
+
+        // The same again over wlr-data-control-v1, for a host that has only that one.
+        void Wayland_WlrDataControlDevice_DataOffer( zwlr_data_control_device_v1 *pDevice, zwlr_data_control_offer_v1 *pOffer );
+        void Wayland_WlrDataControlDevice_Selection( zwlr_data_control_device_v1 *pDevice, zwlr_data_control_offer_v1 *pOffer );
+        void Wayland_WlrDataControlDevice_Finished( zwlr_data_control_device_v1 *pDevice );
+        void Wayland_WlrDataControlDevice_PrimarySelection( zwlr_data_control_device_v1 *pDevice, zwlr_data_control_offer_v1 *pOffer );
+        static const zwlr_data_control_device_v1_listener s_WlrDataControlDeviceListener;
+
+        static void Wayland_WlrDataControlOffer_Offer( void *pData, zwlr_data_control_offer_v1 *pOffer, const char *pMime );
+        static const zwlr_data_control_offer_v1_listener s_WlrDataControlOfferListener;
+
+        void Wayland_WlrDataControlSource_Send( zwlr_data_control_source_v1 *pSource, const char *pMime, int nFd );
+        void Wayland_WlrDataControlSource_Cancelled( zwlr_data_control_source_v1 *pSource );
+        static const zwlr_data_control_source_v1_listener s_WlrDataControlSourceListener;
+
+        // A data control selection or primary_selection event, for either flavour.
+        template <typename Protocol>
+        void OnDataControlOffer( GamescopeSelection eSelection, typename Protocol::OfferProxy *pOffer );
+        // The host withdrew data control: drop both sources and stop publishing.
+        template <typename Protocol>
+        void OnDataControlFinished();
+
+        // Shared handling for a selection event on the seat device, which is read
+        // eagerly: filters the offer, then starts a read, or cancels any
+        // in-flight one if the offer is unusable.
+        void OnSelectionOffer( GamescopeSelection eSelection, std::vector<std::string> offerMimeTypes, const std::function<void( const char *pszMimeType, int nWriteFd )> &fnReceive, const std::function<void()> &fnDestroyOffer );
+        // Creates a pipe, lets fnReceive() request pszMimeType into it, and watches
+        // the read end on wlserver's event loop. An eager read commits into the
+        // session; a lazy one answers the nested client that asked for it.
+        bool QueueSelectionRead( GamescopeSelection eSelection, const char *pszMimeType, bool bEager, uint64_t ulEpoch, const std::function<void( int nWriteFd )> &fnReceive );
+        bool IsSelectionReadInFlight( GamescopeSelection eSelection, const char *pszMimeType, uint64_t ulEpoch );
+        void CancelSelectionRead( GamescopeSelection eSelection );
+        // The seat's primary selection device, bound only when the seat carries
+        // the inbound direction.
+        void BindSeatPrimarySelection();
+        // The host cleared eSelection: drops its offer, then commits an empty selection.
+        void ClearSelection( GamescopeSelection eSelection );
+        void ClearSelectionLocked( GamescopeSelection eSelection );
+        void PublishPendingSelections();
+
+        // INestedHints, via CWaylandConnector.
+        bool FetchHostSelection( GamescopeSelection eSelection, const char *pszMimeType, uint64_t ulEpoch );
+        void DropHostSelection( GamescopeSelection eSelection );
+        bool GetHostSelectionMimeTypes( GamescopeSelection eSelection, std::vector<std::string> &mimeTypes );
+
+        void ReceiveFromRetainedOffer( GamescopeSelection eSelection, const char *pszMimeType, int nWriteFd );
+        void DestroyRetainedOffer( GamescopeSelection eSelection );
+
+        // Drains one readable incoming selection pipe. Runs on the wlserver thread.
+        static int OnSelectionReadable( int nFd, uint32_t uMask, void *pData );
+        // Gives up on a transfer the host never finished. Runs on the wlserver thread.
+        static int OnSelectionReadTimeout( void *pData );
+        // Serves one writable outbound selection pipe. Runs on the wlserver thread.
+        static int OnSelectionWritable( int nFd, uint32_t uMask, void *pData );
+
+        // Takes ownership of nFd and serves the current contents of eSelection
+        // over it; every type we offer is served the same bytes.
+        void WriteSelectionContents( GamescopeSelection eSelection, int nFd );
+        // Serves a send event for whichever selection pSource owns. Both
+        // selections share a source type under data control, so the owner is
+        // found by identity rather than by the callback that delivered it.
+        void SendSelectionSource( void *pSource, int nFd );
+        void DisownSelectionSource( void *pSource );
+        template <typename Protocol>
+        void DestroySelectionSource( void *pSource );
 
         CWaylandInputThread m_InputThread;
 
@@ -926,11 +1049,130 @@ namespace gamescope
 
         wl_data_device_manager *m_pDataDeviceManager = nullptr;
         wl_data_device *m_pDataDevice = nullptr;
-        std::shared_ptr<std::string> m_pClipboard = nullptr;
+        wl_data_offer *m_pDragOffer = nullptr;
 
         zwp_primary_selection_device_manager_v1 *m_pPrimarySelectionDeviceManager = nullptr;
         zwp_primary_selection_device_v1 *m_pPrimarySelectionDevice = nullptr;
-        std::shared_ptr<std::string> m_pPrimarySelection = nullptr;
+
+        ext_data_control_manager_v1 *m_pExtDataControlManager = nullptr;
+        ext_data_control_device_v1 *m_pExtDataControlDevice = nullptr;
+
+        zwlr_data_control_manager_v1 *m_pWlrDataControlManager = nullptr;
+        zwlr_data_control_device_v1 *m_pWlrDataControlDevice = nullptr;
+
+        // Listener data for a host offer, owned by the offer proxy until it
+        // resolves into a selection, a drag, or a destroy. Main thread only.
+        struct SelectionOffer
+        {
+            std::vector<std::string> mimeTypes;
+        };
+
+        struct ExtDataControlProtocol
+        {
+            using Source = ext_data_control_source_v1;
+            using OfferProxy = ext_data_control_offer_v1;
+            static constexpr SelectionTransport kTransport = SelectionTransport::ExtDataControl;
+            static bool Available( CWaylandBackend *pBackend ) { return pBackend->m_pExtDataControlDevice != nullptr; }
+            static Source *CreateSource( CWaylandBackend *pBackend ) { return ext_data_control_manager_v1_create_data_source( pBackend->m_pExtDataControlManager ); }
+            static void AddListener( Source *pSource, CWaylandBackend *pBackend ) { ext_data_control_source_v1_add_listener( pSource, &pBackend->s_ExtDataControlSourceListener, pBackend ); }
+            static void Offer( Source *pSource, const char *pMime ) { ext_data_control_source_v1_offer( pSource, pMime ); }
+            static void SetSelection( CWaylandBackend *pBackend, Source *pSource ) { ext_data_control_device_v1_set_selection( pBackend->m_pExtDataControlDevice, pSource ); }
+            static void SetPrimarySelection( CWaylandBackend *pBackend, Source *pSource ) { ext_data_control_device_v1_set_primary_selection( pBackend->m_pExtDataControlDevice, pSource ); }
+            static void DestroySource( Source *pSource ) { ext_data_control_source_v1_destroy( pSource ); }
+            static SelectionOffer *OfferData( OfferProxy *pOffer ) { return (SelectionOffer *)ext_data_control_offer_v1_get_user_data( pOffer ); }
+            static void ReceiveOffer( OfferProxy *pOffer, const char *pMime, int nFd ) { ext_data_control_offer_v1_receive( pOffer, pMime, nFd ); }
+            static void DestroyOffer( OfferProxy *pOffer ) { ext_data_control_offer_v1_destroy( pOffer ); }
+        };
+
+        struct WlrDataControlProtocol
+        {
+            using Source = zwlr_data_control_source_v1;
+            using OfferProxy = zwlr_data_control_offer_v1;
+            static constexpr SelectionTransport kTransport = SelectionTransport::WlrDataControl;
+            static bool Available( CWaylandBackend *pBackend ) { return pBackend->m_pWlrDataControlDevice != nullptr; }
+            static Source *CreateSource( CWaylandBackend *pBackend ) { return zwlr_data_control_manager_v1_create_data_source( pBackend->m_pWlrDataControlManager ); }
+            static void AddListener( Source *pSource, CWaylandBackend *pBackend ) { zwlr_data_control_source_v1_add_listener( pSource, &pBackend->s_WlrDataControlSourceListener, pBackend ); }
+            static void Offer( Source *pSource, const char *pMime ) { zwlr_data_control_source_v1_offer( pSource, pMime ); }
+            static void SetSelection( CWaylandBackend *pBackend, Source *pSource ) { zwlr_data_control_device_v1_set_selection( pBackend->m_pWlrDataControlDevice, pSource ); }
+            static void SetPrimarySelection( CWaylandBackend *pBackend, Source *pSource ) { zwlr_data_control_device_v1_set_primary_selection( pBackend->m_pWlrDataControlDevice, pSource ); }
+            static void DestroySource( Source *pSource ) { zwlr_data_control_source_v1_destroy( pSource ); }
+            static SelectionOffer *OfferData( OfferProxy *pOffer ) { return (SelectionOffer *)zwlr_data_control_offer_v1_get_user_data( pOffer ); }
+            static void ReceiveOffer( OfferProxy *pOffer, const char *pMime, int nFd ) { zwlr_data_control_offer_v1_receive( pOffer, pMime, nFd ); }
+            static void DestroyOffer( OfferProxy *pOffer ) { zwlr_data_control_offer_v1_destroy( pOffer ); }
+        };
+
+        // Per-selection state, indexed by GamescopeSelection. The source handle
+        // is stored as void *; m_eSelectionTransport says which protocol it is.
+        struct SelectionState
+        {
+            // Protects pContents and pPendingContents, written by SetSelection and read by the send callback on the main thread.
+            std::mutex contentsMutex;
+            std::shared_ptr<std::string> pContents;
+            // A PRIMARY change made while the host focus is elsewhere waits
+            // here, so the send callback keeps serving what the host last saw
+            // until Wayland_Keyboard_Enter lifts the gate.
+            std::shared_ptr<std::string> pPendingContents;
+            // Selection source we currently own on the host, if any. Under data
+            // control this is the whole of our ownership state: the request
+            // cannot be refused, and cancelled reports every loss.
+            std::atomic<void *> pOwnedSource = nullptr;
+        };
+        SelectionState m_Selections[ GAMESCOPE_SELECTION_COUNT ];
+
+        // The host's offer for a selection, kept rather than read: a host copy
+        // nobody pastes never enters gamescope's memory. Main thread only.
+        struct RetainedOffer
+        {
+            void *pOffer = nullptr;
+            // Outlives the offer proxy because it is the offer listener's data.
+            SelectionOffer *pData = nullptr;
+            SelectionTransport eTransport = SelectionTransport::Unavailable;
+        };
+        RetainedOffer m_RetainedOffers[ GAMESCOPE_SELECTION_COUNT ];
+
+        // Both transfer directions live on wlserver's wl_event_loop, which the
+        // wlserver thread dispatches under wlserver_lock(); everything below is
+        // touched only with that lock held, so it needs no locking of its own.
+        struct SelectionRead
+        {
+            CWaylandBackend *pBackend = nullptr;
+            wl_event_source *pSource = nullptr;
+            wl_event_source *pTimer = nullptr;
+            int nFd = -1;
+            std::string sData;
+            GamescopeSelection eSelection = GAMESCOPE_SELECTION_CLIPBOARD;
+            std::string sMimeType;
+            uint64_t ulEpoch = 0;
+            bool bEager = false;
+            bool bSkipIfUnchanged = false;
+        };
+        // Keyed on the MIME type as well as the selection: two nested clients
+        // can be converting one selection to different types at once.
+        std::vector<std::unique_ptr<SelectionRead>> m_SelectionReads;
+        // What we last committed for each selection under the seat fallback,
+        // which re-sends the host selection on every keyboard enter.
+        std::string m_sLastCommittedSelection[ GAMESCOPE_SELECTION_COUNT ];
+        void FinishSelectionRead( SelectionRead *pRead );
+        void DiscardEagerSelectionReads( GamescopeSelection eSelection );
+        void FailSelectionReads( GamescopeSelection eSelection );
+
+        // How long a nested client's paste waits on the host before we give up.
+        static constexpr int k_nSelectionReadDeadlineMs = 1000;
+
+        static constexpr size_t k_uMaxPendingSelectionWrites = 16;
+        static constexpr uint64_t k_ulSelectionWriteDeadlineNanos = 30ul * 1000000000ul;
+
+        // A pipe write-end handed to us by a host reader, with the contents it asked for.
+        struct SelectionWrite
+        {
+            CWaylandBackend *pBackend = nullptr;
+            wl_event_source *pSource = nullptr;
+            int nFd = -1;
+            std::shared_ptr<const std::string> pContents;
+            size_t uOffset = 0;
+            uint64_t ulStartNanos = 0;
+        };
+        std::vector<std::unique_ptr<SelectionWrite>> m_SelectionWrites;
 
         struct
         {
@@ -961,7 +1203,6 @@ namespace gamescope
 
         uint32_t m_uPointerEnterSerial = 0;
         bool m_bMouseEntered = false;
-        uint32_t m_uKeyboardEnterSerial = 0;
         bool m_bKeyboardEntered = false;
 
         std::shared_ptr<INestedHints::CursorInfo> m_pCursorInfo;
@@ -1024,19 +1265,61 @@ namespace gamescope
         .supported_primaries_named = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WPColorManager_SupportedPrimariesNamed ),
         .done        = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WPColorManager_ColorManagerDone ),
     };
-    const wl_data_source_listener CWaylandBackend::s_DataSourceListener =
+    const wl_data_device_listener CWaylandBackend::s_DataDeviceListener =
     {
-        .target             = WAYLAND_NULL(),
-        .send               = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataSource_Send ),
-        .cancelled          = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataSource_Cancelled ),
-        .dnd_drop_performed = WAYLAND_NULL(),
-        .dnd_finished       = WAYLAND_NULL(),
-        .action             = WAYLAND_NULL(),
+        .data_offer = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataDevice_DataOffer ),
+        .enter      = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataDevice_Enter ),
+        .leave      = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataDevice_Leave ),
+        .motion     = WAYLAND_NULL(),
+        .drop       = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataDevice_Drop ),
+        .selection  = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataDevice_Selection ),
     };
-    const zwp_primary_selection_source_v1_listener CWaylandBackend::s_PrimarySelectionSourceListener =
+    const wl_data_offer_listener CWaylandBackend::s_DataOfferListener =
     {
-        .send      = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_PrimarySelectionSource_Send ),
-        .cancelled = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_PrimarySelectionSource_Cancelled ),
+        .offer          = Wayland_DataOffer_Offer,
+        .source_actions = WAYLAND_NULL(),
+        .action         = WAYLAND_NULL(),
+    };
+    const zwp_primary_selection_device_v1_listener CWaylandBackend::s_PrimarySelectionDeviceListener =
+    {
+        .data_offer = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_PrimarySelectionDevice_DataOffer ),
+        .selection  = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_PrimarySelectionDevice_Selection ),
+    };
+    const zwp_primary_selection_offer_v1_listener CWaylandBackend::s_PrimarySelectionOfferListener =
+    {
+        .offer = Wayland_PrimarySelectionOffer_Offer,
+    };
+    const ext_data_control_device_v1_listener CWaylandBackend::s_ExtDataControlDeviceListener =
+    {
+        .data_offer        = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_ExtDataControlDevice_DataOffer ),
+        .selection         = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_ExtDataControlDevice_Selection ),
+        .finished          = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_ExtDataControlDevice_Finished ),
+        .primary_selection = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_ExtDataControlDevice_PrimarySelection ),
+    };
+    const ext_data_control_offer_v1_listener CWaylandBackend::s_ExtDataControlOfferListener =
+    {
+        .offer = Wayland_ExtDataControlOffer_Offer,
+    };
+    const ext_data_control_source_v1_listener CWaylandBackend::s_ExtDataControlSourceListener =
+    {
+        .send      = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_ExtDataControlSource_Send ),
+        .cancelled = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_ExtDataControlSource_Cancelled ),
+    };
+    const zwlr_data_control_device_v1_listener CWaylandBackend::s_WlrDataControlDeviceListener =
+    {
+        .data_offer        = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WlrDataControlDevice_DataOffer ),
+        .selection         = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WlrDataControlDevice_Selection ),
+        .finished          = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WlrDataControlDevice_Finished ),
+        .primary_selection = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WlrDataControlDevice_PrimarySelection ),
+    };
+    const zwlr_data_control_offer_v1_listener CWaylandBackend::s_WlrDataControlOfferListener =
+    {
+        .offer = Wayland_WlrDataControlOffer_Offer,
+    };
+    const zwlr_data_control_source_v1_listener CWaylandBackend::s_WlrDataControlSourceListener =
+    {
+        .send      = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WlrDataControlSource_Send ),
+        .cancelled = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WlrDataControlSource_Cancelled ),
     };
 
     //////////////////
@@ -1580,38 +1863,107 @@ namespace gamescope
         }
     }
 
+    template <typename Protocol>
+    void CWaylandConnector::SetSelectionFor( GamescopeSelection eSelection )
+    {
+        if ( !Protocol::Available( m_pBackend ) )
+            return;
+
+        CWaylandBackend::SelectionState &selection = m_pBackend->m_Selections[eSelection];
+
+        // Whatever the host was offering is superseded by what we are about to publish.
+        m_pBackend->DropHostSelection( eSelection );
+
+        typename Protocol::Source *source = Protocol::CreateSource( m_pBackend );
+        Protocol::AddListener( source, m_pBackend );
+        for ( const char *pMimeType : wayland_selection::k_SupportedMimeTypes )
+            Protocol::Offer( source, pMimeType );
+
+        if ( eSelection == GAMESCOPE_SELECTION_PRIMARY )
+            Protocol::SetPrimarySelection( m_pBackend, source );
+        else
+            Protocol::SetSelection( m_pBackend, source );
+
+        // Data control carries no serial and cannot be refused, so the new
+        // source is already the selection and destroying the one it replaced
+        // cannot clear it.
+        m_pBackend->DestroySelectionSource<Protocol>( selection.pOwnedSource.exchange( source ) );
+
+        // The host offer behind any announcement is gone with DropHostSelection
+        // above, so what steamcompmgr serves has to become these bytes.
+        std::shared_ptr<const std::string> pContents;
+        {
+            std::scoped_lock lock( selection.contentsMutex );
+            pContents = selection.pContents;
+        }
+        gamescope_set_selection_contents( pContents ? *pContents : std::string{}, wayland_selection::k_szUtf8MimeType, eSelection );
+
+        // The host connection is only dispatched while we are painting, so a
+        // copy made with nothing on screen would otherwise sit unsent.
+        wl_display_flush( m_pBackend->GetDisplay() );
+    }
+
     void CWaylandConnector::SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection )
     {
-        if ( m_pBackend->m_pDataDeviceManager && !m_pBackend->m_pDataDevice )
-            m_pBackend->m_pDataDevice = wl_data_device_manager_get_data_device( m_pBackend->m_pDataDeviceManager, m_pBackend->m_pSeat );
+        // A game that rewrites PRIMARY as the user drags a mouse would otherwise
+        // stomp the host's middle-click buffer from the background.
+        const bool bHoldForFocus = eSelection == GAMESCOPE_SELECTION_PRIMARY && !m_pBackend->m_bKeyboardEntered;
 
-        if ( m_pBackend->m_pPrimarySelectionDeviceManager && !m_pBackend->m_pPrimarySelectionDevice )
-            m_pBackend->m_pPrimarySelectionDevice = zwp_primary_selection_device_manager_v1_get_device( m_pBackend->m_pPrimarySelectionDeviceManager, m_pBackend->m_pSeat );
+        CWaylandBackend::SelectionState &selection = m_pBackend->m_Selections[eSelection];
+        {
+            std::scoped_lock lock( selection.contentsMutex );
+            if ( bHoldForFocus )
+            {
+                selection.pPendingContents = std::move( szContents );
+            }
+            else
+            {
+                selection.pContents = std::move( szContents );
+                selection.pPendingContents = nullptr;
+            }
+        }
 
-        if ( eSelection == GAMESCOPE_SELECTION_CLIPBOARD && m_pBackend->m_pDataDevice )
+        if ( bHoldForFocus )
         {
-            m_pBackend->m_pClipboard = szContents;
-            wl_data_source *source = wl_data_device_manager_create_data_source( m_pBackend->m_pDataDeviceManager );
-            wl_data_source_add_listener( source, &m_pBackend->s_DataSourceListener, m_pBackend );
-            wl_data_source_offer( source, "text/plain" );
-            wl_data_source_offer( source, "text/plain;charset=utf-8" );
-            wl_data_source_offer( source, "TEXT" );
-            wl_data_source_offer( source, "STRING" );
-            wl_data_source_offer( source, "UTF8_STRING" );
-            wl_data_device_set_selection( m_pBackend->m_pDataDevice, source, m_pBackend->m_uKeyboardEnterSerial );
+            // The nested client's take already emptied what steamcompmgr serves,
+            // so the session gets these bytes even though the host is not told
+            // until focus returns.
+            std::shared_ptr<const std::string> pPending;
+            {
+                std::scoped_lock lock( selection.contentsMutex );
+                pPending = selection.pPendingContents;
+            }
+            gamescope_set_selection_contents( pPending ? *pPending : std::string{}, wayland_selection::k_szUtf8MimeType, eSelection );
+            return;
         }
-        else if ( eSelection == GAMESCOPE_SELECTION_PRIMARY && m_pBackend->m_pPrimarySelectionDevice )
+
+        switch ( m_pBackend->m_eSelectionTransport )
         {
-            m_pBackend->m_pPrimarySelection = szContents;
-            zwp_primary_selection_source_v1 *source = zwp_primary_selection_device_manager_v1_create_source( m_pBackend->m_pPrimarySelectionDeviceManager );
-            zwp_primary_selection_source_v1_add_listener( source, &m_pBackend->s_PrimarySelectionSourceListener, m_pBackend );
-            zwp_primary_selection_source_v1_offer( source, "text/plain" );
-            zwp_primary_selection_source_v1_offer( source, "text/plain;charset=utf-8" );
-            zwp_primary_selection_source_v1_offer( source, "TEXT" );
-            zwp_primary_selection_source_v1_offer( source, "STRING" );
-            zwp_primary_selection_source_v1_offer( source, "UTF8_STRING" );
-            zwp_primary_selection_device_v1_set_selection( m_pBackend->m_pPrimarySelectionDevice, source, m_pBackend->m_uPointerEnterSerial );
+            case CWaylandBackend::SelectionTransport::ExtDataControl:
+                SetSelectionFor<CWaylandBackend::ExtDataControlProtocol>( eSelection );
+                break;
+
+            case CWaylandBackend::SelectionTransport::WlrDataControl:
+                SetSelectionFor<CWaylandBackend::WlrDataControlProtocol>( eSelection );
+                break;
+
+            // The seat's set_selection is checked against a serial we cannot
+            // observe and refused with nothing on the wire to say so, so the
+            // seat device carries the inbound direction only.
+            case CWaylandBackend::SelectionTransport::Seat:
+            case CWaylandBackend::SelectionTransport::Unavailable:
+                break;
         }
+    }
+
+    bool CWaylandConnector::FetchHostSelection( GamescopeSelection eSelection, const char *pszMimeType, uint64_t ulEpoch )
+    {
+        return m_pBackend->FetchHostSelection( eSelection, pszMimeType, ulEpoch );
+    }
+
+    bool CWaylandConnector::GetHostSelectionMimeTypes( GamescopeSelection eSelection, std::vector<std::string> &mimeTypes )
+    {
+        return m_pBackend->GetHostSelectionMimeTypes( eSelection, mimeTypes );
     }
 
     //////////////////
@@ -2346,6 +2698,52 @@ namespace gamescope
     {
     }
 
+    CWaylandBackend::~CWaylandBackend()
+    {
+        // wlserver_run() destroys the display, and with it the event loop, then
+        // nulls wlserver.display under the lock; the sources are already gone by
+        // then and removing one would touch freed memory. The fds are ours
+        // either way.
+        wlserver_lock();
+        const bool bEventLoopAlive = wlserver.display != nullptr;
+
+        if ( bEventLoopAlive )
+        {
+            for ( uint32_t uSelection = 0; uSelection < GAMESCOPE_SELECTION_COUNT; uSelection++ )
+                ClearSelectionLocked( GamescopeSelection( uSelection ) );
+        }
+
+        for ( std::unique_ptr<SelectionRead> &pRead : m_SelectionReads )
+        {
+            if ( bEventLoopAlive && pRead->pSource )
+                wl_event_source_remove( pRead->pSource );
+            pRead->pSource = nullptr;
+            if ( bEventLoopAlive && pRead->pTimer )
+                wl_event_source_remove( pRead->pTimer );
+            pRead->pTimer = nullptr;
+            if ( pRead->nFd >= 0 )
+                close( pRead->nFd );
+            pRead->nFd = -1;
+
+            if ( !pRead->bEager )
+                gamescope_deliver_selection_fetch( pRead->eSelection, std::move( pRead->sMimeType ), std::string{}, false, pRead->ulEpoch );
+        }
+        m_SelectionReads.clear();
+
+        for ( std::unique_ptr<SelectionWrite> &pWrite : m_SelectionWrites )
+        {
+            if ( bEventLoopAlive && pWrite->pSource )
+                wl_event_source_remove( pWrite->pSource );
+            pWrite->pSource = nullptr;
+            if ( pWrite->nFd >= 0 )
+                close( pWrite->nFd );
+            pWrite->nFd = -1;
+        }
+        m_SelectionWrites.clear();
+
+        wlserver_unlock( bEventLoopAlive );
+    }
+
     bool CWaylandBackend::Init()
     {
         g_nOutputWidth = g_nPreferredOutputWidth;
@@ -2452,6 +2850,67 @@ namespace gamescope
         {
             xdg_log.errorf( "Failed to initialize input thread" );
             return false;
+        }
+
+        // The seat data device stays bound whatever carries selections: drag
+        // offers arrive on it, and destroying one cancels the host's drag.
+        if ( m_pDataDeviceManager && !m_pDataDevice )
+        {
+            m_pDataDevice = wl_data_device_manager_get_data_device( m_pDataDeviceManager, m_pSeat );
+            if ( m_pDataDevice )
+            {
+                wl_data_device_add_listener( m_pDataDevice, &s_DataDeviceListener, this );
+            }
+            else
+            {
+                xdg_log.errorf( "Failed to get wl_data_device; clipboard sync disabled." );
+            }
+        }
+
+        if ( m_pExtDataControlManager )
+        {
+            m_pExtDataControlDevice = ext_data_control_manager_v1_get_data_device( m_pExtDataControlManager, m_pSeat );
+            if ( m_pExtDataControlDevice )
+            {
+                ext_data_control_device_v1_add_listener( m_pExtDataControlDevice, &s_ExtDataControlDeviceListener, this );
+                m_eSelectionTransport = SelectionTransport::ExtDataControl;
+            }
+        }
+
+        if ( m_eSelectionTransport == SelectionTransport::Unavailable && m_pWlrDataControlManager )
+        {
+            m_pWlrDataControlDevice = zwlr_data_control_manager_v1_get_data_device( m_pWlrDataControlManager, m_pSeat );
+            if ( m_pWlrDataControlDevice )
+            {
+                zwlr_data_control_device_v1_add_listener( m_pWlrDataControlDevice, &s_WlrDataControlDeviceListener, this );
+                m_eSelectionTransport = SelectionTransport::WlrDataControl;
+            }
+        }
+
+        if ( m_eSelectionTransport == SelectionTransport::Unavailable && m_pDataDevice )
+        {
+            m_eSelectionTransport = SelectionTransport::Seat;
+            BindSeatPrimarySelection();
+        }
+
+        switch ( m_eSelectionTransport )
+        {
+            case SelectionTransport::ExtDataControl:
+                xdg_log.infof( "Syncing selections over ext-data-control-v1." );
+                break;
+
+            case SelectionTransport::WlrDataControl:
+                xdg_log.infof( "Syncing selections over wlr-data-control-v1." );
+                break;
+
+            case SelectionTransport::Seat:
+                xdg_log.infof( "Syncing selections over the seat data device." );
+                xdg_log.infof( "The host's selections reach the nested session; selections made inside it do not reach the host." );
+                break;
+
+            case SelectionTransport::Unavailable:
+                xdg_log.infof( "No host selection protocol; clipboard sync disabled." );
+                break;
         }
 
         xdg_log.infof( "Initted Wayland backend" );
@@ -2969,6 +3428,15 @@ namespace gamescope
         {
             m_pPrimarySelectionDeviceManager = (zwp_primary_selection_device_manager_v1 *)wl_registry_bind( pRegistry, uName, &zwp_primary_selection_device_manager_v1_interface, 1u );
         }
+        else if ( !strcmp( pInterface, ext_data_control_manager_v1_interface.name ) )
+        {
+            m_pExtDataControlManager = (ext_data_control_manager_v1 *)wl_registry_bind( pRegistry, uName, &ext_data_control_manager_v1_interface, 1u );
+        }
+        else if ( !strcmp( pInterface, zwlr_data_control_manager_v1_interface.name ) && uVersion >= 2u )
+        {
+            // Version 2 is the one that carries the primary selection.
+            m_pWlrDataControlManager = (zwlr_data_control_manager_v1 *)wl_registry_bind( pRegistry, uName, &zwlr_data_control_manager_v1_interface, 2u );
+        }
     }
 
     void CWaylandBackend::Wayland_Modifier( zwp_linux_dmabuf_v1 *pDmabuf, uint32_t uFormat, uint32_t uModifierHi, uint32_t uModifierLo )
@@ -3074,8 +3542,9 @@ namespace gamescope
 		if ( !IsGamescopeToplevel( pSurface ) )
 			return;
 
-        m_uKeyboardEnterSerial = uSerial;
         m_bKeyboardEntered = true;
+
+        PublishPendingSelections();
 
         UpdateCursor();
     }
@@ -3125,30 +3594,835 @@ namespace gamescope
 
     // Data Source
 
-    void CWaylandBackend::Wayland_DataSource_Send( struct wl_data_source *pSource, const char *pMime, int nFd )
+    void CWaylandBackend::WriteSelectionContents( GamescopeSelection eSelection, int nFd )
     {
-        ssize_t len = m_pClipboard->length();
-        if ( write( nFd, m_pClipboard->c_str(), len ) != len )
-            xdg_log.infof( "Failed to write all %zd bytes to clipboard", len );
-        close( nFd );
-    }
-    void CWaylandBackend::Wayland_DataSource_Cancelled( struct wl_data_source *pSource )
-    {
-        wl_data_source_destroy( pSource );
+        std::shared_ptr<const std::string> pContents;
+        {
+            std::scoped_lock lock( m_Selections[eSelection].contentsMutex );
+            pContents = m_Selections[eSelection].pContents;
+        }
+
+        // Closing the write end is what tells the host reader the transfer is over.
+        if ( !pContents || pContents->empty() )
+        {
+            close( nFd );
+            return;
+        }
+
+        const int nFlags = fcntl( nFd, F_GETFL, 0 );
+        if ( nFlags < 0 || fcntl( nFd, F_SETFL, nFlags | O_NONBLOCK ) < 0 )
+        {
+            xdg_log.errorf( "Failed to make a selection pipe non-blocking; dropping the transfer." );
+            close( nFd );
+            return;
+        }
+
+        wlserver_lock();
+
+        const uint64_t ulNow = get_time_in_nanos();
+        std::erase_if( m_SelectionWrites, [ ulNow ]( const std::unique_ptr<SelectionWrite> &pEntry )
+        {
+            if ( ulNow < pEntry->ulStartNanos + k_ulSelectionWriteDeadlineNanos )
+                return false;
+
+            xdg_log.debugf( "Dropping an outbound selection transfer the host never drained." );
+
+            if ( pEntry->pSource )
+                wl_event_source_remove( pEntry->pSource );
+            if ( pEntry->nFd >= 0 )
+                close( pEntry->nFd );
+            return true;
+        } );
+
+        if ( m_SelectionWrites.size() >= k_uMaxPendingSelectionWrites )
+        {
+            xdg_log.errorf( "More than %zu outbound selection transfers in flight; dropping one.", k_uMaxPendingSelectionWrites );
+            wlserver_unlock( false );
+            close( nFd );
+            return;
+        }
+
+        auto pWrite = std::make_unique<SelectionWrite>();
+        pWrite->pBackend = this;
+        pWrite->nFd = nFd;
+        pWrite->pContents = std::move( pContents );
+        pWrite->ulStartNanos = ulNow;
+        pWrite->pSource = wl_event_loop_add_fd( wlserver.event_loop, nFd, WL_EVENT_WRITABLE, OnSelectionWritable, pWrite.get() );
+        if ( !pWrite->pSource )
+        {
+            xdg_log.errorf( "Failed to watch an outbound selection pipe; dropping the transfer." );
+            wlserver_unlock( false );
+            close( nFd );
+            return;
+        }
+
+        m_SelectionWrites.push_back( std::move( pWrite ) );
+        wlserver_unlock( false );
     }
 
-    // Primary Selection Source
-
-    void CWaylandBackend::Wayland_PrimarySelectionSource_Send( struct zwp_primary_selection_source_v1 *pSource, const char *pMime, int nFd )
+    void CWaylandBackend::SendSelectionSource( void *pSource, int nFd )
     {
-	ssize_t len = m_pPrimarySelection->length();
-        if ( write( nFd, m_pPrimarySelection->c_str(), len ) != len )
-	    xdg_log.infof( "Failed to write all %zd bytes to clipboard", len );
+        for ( uint32_t uSelection = 0; uSelection < GAMESCOPE_SELECTION_COUNT; uSelection++ )
+        {
+            if ( m_Selections[uSelection].pOwnedSource.load() == pSource )
+            {
+                WriteSelectionContents( GamescopeSelection( uSelection ), nFd );
+                return;
+            }
+        }
+
         close( nFd );
     }
-    void CWaylandBackend::Wayland_PrimarySelectionSource_Cancelled( struct zwp_primary_selection_source_v1 *pSource)
+
+    void CWaylandBackend::BindSeatPrimarySelection()
     {
-        zwp_primary_selection_source_v1_destroy( pSource );
+        if ( !m_pPrimarySelectionDeviceManager || m_pPrimarySelectionDevice )
+            return;
+
+        m_pPrimarySelectionDevice = zwp_primary_selection_device_manager_v1_get_device( m_pPrimarySelectionDeviceManager, m_pSeat );
+        if ( m_pPrimarySelectionDevice )
+            zwp_primary_selection_device_v1_add_listener( m_pPrimarySelectionDevice, &s_PrimarySelectionDeviceListener, this );
+    }
+
+    void CWaylandBackend::PublishPendingSelections()
+    {
+        CWaylandConnector *pConnector = m_pFocusConnector.load();
+        if ( !pConnector )
+            return;
+
+        for ( uint32_t uSelection = 0; uSelection < GAMESCOPE_SELECTION_COUNT; uSelection++ )
+        {
+            SelectionState &selection = m_Selections[uSelection];
+
+            std::shared_ptr<std::string> pContents;
+            {
+                std::scoped_lock lock( selection.contentsMutex );
+                if ( !selection.pPendingContents )
+                    continue;
+
+                pContents = std::move( selection.pPendingContents );
+            }
+
+            pConnector->SetSelection( std::move( pContents ), GamescopeSelection( uSelection ) );
+        }
+    }
+
+    void CWaylandBackend::DisownSelectionSource( void *pSource )
+    {
+        for ( SelectionState &selection : m_Selections )
+        {
+            void *pExpected = pSource;
+            selection.pOwnedSource.compare_exchange_strong( pExpected, nullptr );
+        }
+    }
+
+    template <typename Protocol>
+    void CWaylandBackend::DestroySelectionSource( void *pSource )
+    {
+        if ( !pSource )
+            return;
+
+        Protocol::DestroySource( (typename Protocol::Source *)pSource );
+    }
+
+    // Host-to-client selection
+
+    // A pasted secret should not sit in freed heap. Growing to the capacity
+    // first is what reaches a short string that has been moved out of: the move
+    // copies the bytes into the new string and leaves them behind, and only
+    // [0, size()) is ours to write through data().
+    static void ScrubString( std::string &sData )
+    {
+        sData.resize( sData.capacity(), '\0' );
+        explicit_bzero( sData.data(), sData.size() );
+        sData.clear();
+    }
+
+    // std::string::append would free the old block with the plaintext still in
+    // it, so grow by hand and scrub what we are leaving behind.
+    static void AppendScrubbingGrowth( std::string &sData, const char *pBytes, size_t uLength )
+    {
+        if ( sData.size() + uLength > sData.capacity() )
+        {
+            std::string sGrown;
+            sGrown.reserve( std::max( sData.capacity() * 2, sData.size() + uLength ) );
+            sGrown.assign( sData );
+            ScrubString( sData );
+            sData = std::move( sGrown );
+        }
+
+        sData.append( pBytes, uLength );
+    }
+
+    void CWaylandBackend::FinishSelectionRead( SelectionRead *pRead )
+    {
+        if ( pRead->pSource )
+            wl_event_source_remove( pRead->pSource );
+        pRead->pSource = nullptr;
+
+        if ( pRead->pTimer )
+            wl_event_source_remove( pRead->pTimer );
+        pRead->pTimer = nullptr;
+
+        if ( pRead->nFd >= 0 )
+            close( pRead->nFd );
+        pRead->nFd = -1;
+
+        ScrubString( pRead->sData );
+
+        std::erase_if( m_SelectionReads,
+            [ pRead ]( const std::unique_ptr<SelectionRead> &pEntry ) { return pEntry.get() == pRead; } );
+    }
+
+    void CWaylandBackend::DiscardEagerSelectionReads( GamescopeSelection eSelection )
+    {
+        std::vector<SelectionRead *> reads;
+        for ( const std::unique_ptr<SelectionRead> &pRead : m_SelectionReads )
+        {
+            if ( pRead->bEager && pRead->eSelection == eSelection )
+                reads.push_back( pRead.get() );
+        }
+
+        for ( SelectionRead *pRead : reads )
+            FinishSelectionRead( pRead );
+    }
+
+    void CWaylandBackend::FailSelectionReads( GamescopeSelection eSelection )
+    {
+        std::vector<SelectionRead *> reads;
+        for ( const std::unique_ptr<SelectionRead> &pRead : m_SelectionReads )
+        {
+            if ( pRead->eSelection == eSelection )
+                reads.push_back( pRead.get() );
+        }
+
+        for ( SelectionRead *pRead : reads )
+        {
+            const bool bEager = pRead->bEager;
+            const uint64_t ulEpoch = pRead->ulEpoch;
+            std::string sMimeType = std::move( pRead->sMimeType );
+            FinishSelectionRead( pRead );
+
+            if ( !bEager )
+                gamescope_deliver_selection_fetch( eSelection, std::move( sMimeType ), std::string{}, false, ulEpoch );
+        }
+    }
+
+    bool CWaylandBackend::IsSelectionReadInFlight( GamescopeSelection eSelection, const char *pszMimeType, uint64_t ulEpoch )
+    {
+        wlserver_lock();
+        const bool bInFlight = std::any_of( m_SelectionReads.begin(), m_SelectionReads.end(),
+            [ eSelection, pszMimeType, ulEpoch ]( const std::unique_ptr<SelectionRead> &pRead )
+            {
+                return gamescope::wayland_selection::SelectionReadServes(
+                    pRead->bEager, pRead->eSelection, pRead->sMimeType, pRead->ulEpoch,
+                    eSelection, pszMimeType, ulEpoch );
+            } );
+        wlserver_unlock( false );
+
+        return bInFlight;
+    }
+
+    bool CWaylandBackend::QueueSelectionRead( GamescopeSelection eSelection, const char *pszMimeType, bool bEager, uint64_t ulEpoch, const std::function<void( int nWriteFd )> &fnReceive )
+    {
+        int nFds[2];
+        if ( pipe2( nFds, O_CLOEXEC ) < 0 )
+        {
+            xdg_log.errorf( "Failed to create pipe for selection data." );
+            return false;
+        }
+
+        // Only our read end goes non-blocking: SCM_RIGHTS hands the host the
+        // same open file description as our write end, so pipe2( O_NONBLOCK )
+        // would make the sending client's writes fail with EAGAIN too.
+        const int nFlags = fcntl( nFds[0], F_GETFL, 0 );
+        if ( nFlags < 0 || fcntl( nFds[0], F_SETFL, nFlags | O_NONBLOCK ) < 0 )
+        {
+            xdg_log.errorf( "Failed to make a selection pipe non-blocking; dropping the transfer." );
+            close( nFds[0] );
+            close( nFds[1] );
+            return false;
+        }
+
+        // Close our write end so the read end reaches EOF once the source finishes.
+        fnReceive( nFds[1] );
+        close( nFds[1] );
+        wl_display_flush( m_pDisplay );
+
+        wlserver_lock();
+
+        // Newest wins: an eager read supersedes the one it replaces.
+        if ( bEager )
+            DiscardEagerSelectionReads( eSelection );
+
+        auto pRead = std::make_unique<SelectionRead>();
+        pRead->pBackend = this;
+        pRead->eSelection = eSelection;
+        pRead->sMimeType = pszMimeType;
+        pRead->ulEpoch = ulEpoch;
+        pRead->bEager = bEager;
+        // The seat device re-sends the host selection on every keyboard enter.
+        pRead->bSkipIfUnchanged = bEager;
+        pRead->nFd = nFds[0];
+        pRead->pSource = wl_event_loop_add_fd( wlserver.event_loop, nFds[0], WL_EVENT_READABLE, OnSelectionReadable, pRead.get() );
+        if ( !pRead->pSource )
+        {
+            xdg_log.errorf( "Failed to watch an incoming selection pipe; dropping the transfer." );
+            close( nFds[0] );
+            wlserver_unlock( false );
+            return false;
+        }
+
+        // A nested client's paste is blocked on this, so it cannot wait on the
+        // host forever.
+        // Without a deadline the conversion waits on the host forever: nothing
+        // else wakes steamcompmgr to expire it, and the read holds its slot
+        // against every later paste of the same type.
+        if ( !bEager )
+        {
+            pRead->pTimer = wl_event_loop_add_timer( wlserver.event_loop, OnSelectionReadTimeout, pRead.get() );
+            if ( !pRead->pTimer || wl_event_source_timer_update( pRead->pTimer, k_nSelectionReadDeadlineMs ) < 0 )
+            {
+                xdg_log.errorf( "Failed to arm the selection read deadline; dropping the transfer." );
+
+                if ( pRead->pTimer )
+                    wl_event_source_remove( pRead->pTimer );
+                wl_event_source_remove( pRead->pSource );
+                close( nFds[0] );
+
+                wlserver_unlock( false );
+                return false;
+            }
+        }
+
+        m_SelectionReads.push_back( std::move( pRead ) );
+
+        wlserver_unlock( false );
+
+        return true;
+    }
+
+    void CWaylandBackend::CancelSelectionRead( GamescopeSelection eSelection )
+    {
+        wlserver_lock();
+        DiscardEagerSelectionReads( eSelection );
+        wlserver_unlock( false );
+    }
+
+    void CWaylandBackend::DestroyRetainedOffer( GamescopeSelection eSelection )
+    {
+        RetainedOffer &offer = m_RetainedOffers[eSelection];
+        if ( !offer.pOffer )
+            return;
+
+        switch ( offer.eTransport )
+        {
+            case SelectionTransport::ExtDataControl:
+                ExtDataControlProtocol::DestroyOffer( (ext_data_control_offer_v1 *)offer.pOffer );
+                break;
+
+            case SelectionTransport::WlrDataControl:
+                WlrDataControlProtocol::DestroyOffer( (zwlr_data_control_offer_v1 *)offer.pOffer );
+                break;
+
+            case SelectionTransport::Seat:
+            case SelectionTransport::Unavailable:
+                break;
+        }
+
+        delete offer.pData;
+        offer = RetainedOffer{};
+    }
+
+    void CWaylandBackend::ReceiveFromRetainedOffer( GamescopeSelection eSelection, const char *pszMimeType, int nWriteFd )
+    {
+        RetainedOffer &offer = m_RetainedOffers[eSelection];
+
+        switch ( offer.eTransport )
+        {
+            case SelectionTransport::ExtDataControl:
+                ExtDataControlProtocol::ReceiveOffer( (ext_data_control_offer_v1 *)offer.pOffer, pszMimeType, nWriteFd );
+                break;
+
+            case SelectionTransport::WlrDataControl:
+                WlrDataControlProtocol::ReceiveOffer( (zwlr_data_control_offer_v1 *)offer.pOffer, pszMimeType, nWriteFd );
+                break;
+
+            case SelectionTransport::Seat:
+            case SelectionTransport::Unavailable:
+                break;
+        }
+    }
+
+    bool CWaylandBackend::FetchHostSelection( GamescopeSelection eSelection, const char *pszMimeType, uint64_t ulEpoch )
+    {
+        const RetainedOffer &offer = m_RetainedOffers[eSelection];
+        if ( !offer.pOffer || !offer.pData )
+            return false;
+
+        if ( !gamescope::Algorithm::Contains( offer.pData->mimeTypes, std::string( pszMimeType ) ) )
+            return false;
+
+        // A second nested client asking for the same type at the same epoch rides
+        // on the transfer already running for it.
+        if ( IsSelectionReadInFlight( eSelection, pszMimeType, ulEpoch ) )
+            return true;
+
+        return QueueSelectionRead( eSelection, pszMimeType, false, ulEpoch,
+            [ this, eSelection, pszMimeType ]( int nWriteFd ) { ReceiveFromRetainedOffer( eSelection, pszMimeType, nWriteFd ); } );
+    }
+
+    bool CWaylandBackend::GetHostSelectionMimeTypes( GamescopeSelection eSelection, std::vector<std::string> &mimeTypes )
+    {
+        const RetainedOffer &offer = m_RetainedOffers[eSelection];
+        if ( !offer.pOffer || !offer.pData )
+            return false;
+
+        mimeTypes = offer.pData->mimeTypes;
+        return true;
+    }
+
+    void CWaylandBackend::DropHostSelection( GamescopeSelection eSelection )
+    {
+        DestroyRetainedOffer( eSelection );
+
+        wlserver_lock();
+        FailSelectionReads( eSelection );
+        wlserver_unlock( false );
+    }
+
+    void CWaylandBackend::ClearSelection( GamescopeSelection eSelection )
+    {
+        wlserver_lock();
+        ClearSelectionLocked( eSelection );
+        wlserver_unlock( false );
+    }
+
+    void CWaylandBackend::ClearSelectionLocked( GamescopeSelection eSelection )
+    {
+        DestroyRetainedOffer( eSelection );
+        FailSelectionReads( eSelection );
+        gamescope_set_selection_locked( std::string{}, std::string{}, eSelection );
+    }
+
+    // Runs on the wlserver thread with the wlserver lock held.
+    int CWaylandBackend::OnSelectionReadTimeout( void *pData )
+    {
+        SelectionRead *pRead = (SelectionRead *)pData;
+
+        const GamescopeSelection eSelection = pRead->eSelection;
+        const bool bEager = pRead->bEager;
+        const uint64_t ulEpoch = pRead->ulEpoch;
+        std::string sMimeType = std::move( pRead->sMimeType );
+
+        xdg_log.debugf( "The host did not finish a selection transfer in time; dropping it." );
+        pRead->pBackend->FinishSelectionRead( pRead );
+
+        if ( !bEager )
+            gamescope_deliver_selection_fetch( eSelection, std::move( sMimeType ), std::string{}, false, ulEpoch );
+
+        return 0;
+    }
+
+    // Runs on the wlserver thread with the wlserver lock held, so it makes no
+    // Wayland client calls; only the pipe and the committed selection.
+    int CWaylandBackend::OnSelectionReadable( int nFd, uint32_t uMask, void *pData )
+    {
+        SelectionRead *pRead = (SelectionRead *)pData;
+        CWaylandBackend *pBackend = pRead->pBackend;
+
+        auto fnFail = [ pBackend ]( SelectionRead *pTransfer )
+        {
+            const GamescopeSelection eSelection = pTransfer->eSelection;
+            const bool bEager = pTransfer->bEager;
+            const uint64_t ulEpoch = pTransfer->ulEpoch;
+            std::string sMimeType = std::move( pTransfer->sMimeType );
+            pBackend->FinishSelectionRead( pTransfer );
+
+            if ( !bEager )
+                gamescope_deliver_selection_fetch( eSelection, std::move( sMimeType ), std::string{}, false, ulEpoch );
+        };
+
+        if ( uMask & ( WL_EVENT_READABLE | WL_EVENT_HANGUP ) )
+        {
+            char chBuf[ 64 * 1024 ];
+            const ssize_t nRead = read( nFd, chBuf, sizeof( chBuf ) );
+            if ( nRead > 0 )
+            {
+                if ( pRead->sData.size() + size_t( nRead ) > k_uMaxSelectionSize )
+                {
+                    xdg_log.errorf( "Incoming selection exceeds %zu bytes; dropping.", k_uMaxSelectionSize );
+                    fnFail( pRead );
+                }
+                else
+                {
+                    AppendScrubbingGrowth( pRead->sData, chBuf, size_t( nRead ) );
+                }
+
+                explicit_bzero( chBuf, size_t( nRead ) );
+                return 0;
+            }
+
+            if ( nRead == 0 )
+            {
+                std::string sData = std::move( pRead->sData );
+                const GamescopeSelection eSelection = pRead->eSelection;
+                const bool bEager = pRead->bEager;
+                const uint64_t ulEpoch = pRead->ulEpoch;
+                const bool bSkipIfUnchanged = pRead->bSkipIfUnchanged;
+                std::string sMimeType = std::move( pRead->sMimeType );
+                pBackend->FinishSelectionRead( pRead );
+
+                if ( !bEager )
+                {
+                    // At paste time an empty transfer means the offer went
+                    // inert, not that the host's selection is empty.
+                    const bool bSuccess = !sData.empty();
+                    gamescope_deliver_selection_fetch( eSelection, std::move( sMimeType ), std::move( sData ), bSuccess, ulEpoch );
+                    // A short string moves by copy, so the plaintext is still here.
+                    ScrubString( sData );
+                    return 0;
+                }
+
+                // wlroots closes the pipe with nothing in it when the host
+                // selection changed between its event and our receive.
+                if ( sData.empty() )
+                    return 0;
+
+                // Re-committing what we already committed would take the X
+                // selection back from whatever copied inside the session since.
+                if ( bSkipIfUnchanged && sData == pBackend->m_sLastCommittedSelection[eSelection] )
+                {
+                    ScrubString( sData );
+                    return 0;
+                }
+
+                ScrubString( pBackend->m_sLastCommittedSelection[eSelection] );
+                pBackend->m_sLastCommittedSelection[eSelection] = sData;
+                gamescope_set_selection_locked( std::move( sData ), std::move( sMimeType ), eSelection );
+                ScrubString( sData );
+                return 0;
+            }
+
+            if ( errno == EAGAIN || errno == EINTR )
+                return 0;
+
+            fnFail( pRead );
+            return 0;
+        }
+
+        if ( uMask & WL_EVENT_ERROR )
+            fnFail( pRead );
+
+        return 0;
+    }
+
+    // Runs on the wlserver thread with the wlserver lock held.
+    int CWaylandBackend::OnSelectionWritable( int nFd, uint32_t uMask, void *pData )
+    {
+        SelectionWrite *pWrite = (SelectionWrite *)pData;
+        CWaylandBackend *pBackend = pWrite->pBackend;
+
+        auto fnFinish = [ pBackend, pWrite ]()
+        {
+            wl_event_source_remove( pWrite->pSource );
+            pWrite->pSource = nullptr;
+            close( pWrite->nFd );
+            pWrite->nFd = -1;
+            std::erase_if( pBackend->m_SelectionWrites,
+                [ pWrite ]( const std::unique_ptr<SelectionWrite> &pEntry ) { return pEntry.get() == pWrite; } );
+        };
+
+        if ( uMask & ( WL_EVENT_HANGUP | WL_EVENT_ERROR ) )
+        {
+            fnFinish();
+            return 0;
+        }
+
+        const size_t uRemaining = pWrite->pContents->size() - pWrite->uOffset;
+        const ssize_t nWritten = write( nFd, pWrite->pContents->data() + pWrite->uOffset, uRemaining );
+        if ( nWritten < 0 )
+        {
+            if ( errno == EINTR || errno == EAGAIN )
+                return 0;
+
+            fnFinish();
+            return 0;
+        }
+
+        pWrite->uOffset += size_t( nWritten );
+        if ( pWrite->uOffset >= pWrite->pContents->size() )
+            fnFinish();
+
+        return 0;
+    }
+
+    void CWaylandBackend::OnSelectionOffer( GamescopeSelection eSelection, std::vector<std::string> offerMimeTypes, const std::function<void( const char *pszMimeType, int nWriteFd )> &fnReceive, const std::function<void()> &fnDestroyOffer )
+    {
+        if ( const char *pMimeType = wayland_selection::FirstSupportedMimeType( wayland_selection::k_SupportedMimeTypes, offerMimeTypes ) )
+        {
+            QueueSelectionRead( eSelection, pMimeType, true, 0, [&]( int nWriteFd ) { fnReceive( pMimeType, nWriteFd ); } );
+        }
+        else
+        {
+            CancelSelectionRead( eSelection );
+            xdg_log.debugf( "No supported MIME type in the selection offer; leaving the previous selection in place." );
+        }
+
+        fnDestroyOffer();
+    }
+
+    void CWaylandBackend::Wayland_DataDevice_DataOffer( struct wl_data_device *pDevice, struct wl_data_offer *pOffer )
+    {
+        SelectionOffer *pSelectionOffer = new SelectionOffer{};
+        wl_data_offer_add_listener( pOffer, &s_DataOfferListener, pSelectionOffer );
+    }
+
+    void CWaylandBackend::Wayland_DataOffer_Offer( void *pData, struct wl_data_offer *pOffer, const char *pMime )
+    {
+        ( (SelectionOffer *)pData )->mimeTypes.emplace_back( pMime );
+    }
+
+    // Drag-and-drop is not accepted, but destroying a v3 drag offer while its
+    // source is attached makes wlroots destroy the source (data_offer_destroy
+    // in wlr_data_offer.c), cancelling the host's drag. Hold the offer until
+    // leave or drop.
+    void CWaylandBackend::Wayland_DataDevice_Enter( wl_data_device *pDataDevice, uint32_t uSerial, wl_surface *pSurface, wl_fixed_t x, wl_fixed_t y, wl_data_offer *pOffer )
+    {
+        // wl_data_device.enter carries a null offer when the drag has no source.
+        if ( pOffer )
+        {
+            delete (SelectionOffer *)wl_data_offer_get_user_data( pOffer );
+            wl_data_offer_set_user_data( pOffer, nullptr );
+        }
+
+        if ( m_pDragOffer )
+            wl_data_offer_destroy( m_pDragOffer );
+        m_pDragOffer = pOffer;
+
+        // A null mime type declines every type, which stops the host's drag
+        // source showing a copy action over the gamescope window. wlroots then
+        // never sends drop, which it only does for an offer that accepted a
+        // type; Wayland_DataDevice_Drop is there for hosts that send it anyway.
+        if ( pOffer )
+            wl_data_offer_accept( pOffer, uSerial, nullptr );
+    }
+
+    void CWaylandBackend::Wayland_DataDevice_Leave( wl_data_device *pDataDevice )
+    {
+        if ( m_pDragOffer )
+        {
+            delete (SelectionOffer *)wl_data_offer_get_user_data( m_pDragOffer );
+            wl_data_offer_destroy( m_pDragOffer );
+        }
+        m_pDragOffer = nullptr;
+    }
+
+    void CWaylandBackend::Wayland_DataDevice_Drop( wl_data_device *pDataDevice )
+    {
+        Wayland_DataDevice_Leave( pDataDevice );
+    }
+
+    void CWaylandBackend::Wayland_DataDevice_Selection( wl_data_device *pDataDevice, wl_data_offer *pOffer )
+    {
+        // The data control device is authoritative when we have one; the seat
+        // only sees a selection while we hold keyboard focus, so following both
+        // would race.
+        if ( m_eSelectionTransport != SelectionTransport::Seat )
+        {
+            if ( pOffer )
+            {
+                delete (SelectionOffer *)wl_data_offer_get_user_data( pOffer );
+                wl_data_offer_destroy( pOffer );
+            }
+            return;
+        }
+
+        if ( !pOffer )
+        {
+            ClearSelection( GAMESCOPE_SELECTION_CLIPBOARD );
+            return;
+        }
+
+        SelectionOffer *pSelectionOffer = (SelectionOffer *)wl_data_offer_get_user_data( pOffer );
+        OnSelectionOffer( GAMESCOPE_SELECTION_CLIPBOARD, std::move( pSelectionOffer->mimeTypes ),
+            [pOffer]( const char *pszMimeType, int nWriteFd ) { wl_data_offer_receive( pOffer, pszMimeType, nWriteFd ); },
+            [pOffer, pSelectionOffer]() { delete pSelectionOffer; wl_data_offer_destroy( pOffer ); } );
+    }
+
+    void CWaylandBackend::Wayland_PrimarySelectionDevice_DataOffer( struct zwp_primary_selection_device_v1 *pDevice, struct zwp_primary_selection_offer_v1 *pOffer )
+    {
+        SelectionOffer *pSelectionOffer = new SelectionOffer{};
+        zwp_primary_selection_offer_v1_add_listener( pOffer, &s_PrimarySelectionOfferListener, pSelectionOffer );
+    }
+
+    void CWaylandBackend::Wayland_PrimarySelectionOffer_Offer( void *pData, struct zwp_primary_selection_offer_v1 *pOffer, const char *pMime )
+    {
+        ( (SelectionOffer *)pData )->mimeTypes.emplace_back( pMime );
+    }
+
+    void CWaylandBackend::Wayland_PrimarySelectionDevice_Selection( zwp_primary_selection_device_v1 *pDevice, zwp_primary_selection_offer_v1 *pOffer )
+    {
+        if ( !pOffer )
+        {
+            ClearSelection( GAMESCOPE_SELECTION_PRIMARY );
+            return;
+        }
+
+        SelectionOffer *pSelectionOffer = (SelectionOffer *)zwp_primary_selection_offer_v1_get_user_data( pOffer );
+        OnSelectionOffer( GAMESCOPE_SELECTION_PRIMARY, std::move( pSelectionOffer->mimeTypes ),
+            [pOffer]( const char *pszMimeType, int nWriteFd ) { zwp_primary_selection_offer_v1_receive( pOffer, pszMimeType, nWriteFd ); },
+            [pOffer, pSelectionOffer]() { delete pSelectionOffer; zwp_primary_selection_offer_v1_destroy( pOffer ); } );
+    }
+
+    // Host selections over data control
+
+    // The host announced a selection over data control: keep the offer and
+    // publish the types it carries, so a host copy nobody pastes never enters
+    // gamescope's memory.
+    template <typename Protocol>
+    void CWaylandBackend::OnDataControlOffer( GamescopeSelection eSelection, typename Protocol::OfferProxy *pOffer )
+    {
+        if ( !pOffer )
+        {
+            ClearSelection( eSelection );
+            return;
+        }
+
+        SelectionOffer *pSelectionOffer = Protocol::OfferData( pOffer );
+        auto fnDiscardOffer = [pOffer, pSelectionOffer]() { Protocol::DestroyOffer( pOffer ); delete pSelectionOffer; };
+
+        // We hold a live source exactly while we hold the selection, so an
+        // offer arriving now is our own echo or one our source has already
+        // superseded, and consuming it would drop the types we do not
+        // advertise. Dropping it is safe because wlroots destroys the previous
+        // source, and so emits cancelled, before it emits the new selection
+        // event; neither protocol XML orders those two.
+        if ( m_Selections[eSelection].pOwnedSource.load() != nullptr )
+        {
+            DropHostSelection( eSelection );
+            fnDiscardOffer();
+            return;
+        }
+
+        if ( !wayland_selection::FirstSupportedMimeType( wayland_selection::k_SupportedMimeTypes, pSelectionOffer->mimeTypes ) )
+        {
+            // wlroots has already made the offer we were holding inert, so
+            // keeping the announce would refuse every later paste while still
+            // owning a selection nothing else can serve.
+            xdg_log.debugf( "No supported MIME type in the selection offer; releasing the selection." );
+            ClearSelection( eSelection );
+            fnDiscardOffer();
+            return;
+        }
+
+        DropHostSelection( eSelection );
+
+        m_RetainedOffers[eSelection] = RetainedOffer{ .pOffer = pOffer, .pData = pSelectionOffer, .eTransport = Protocol::kTransport };
+
+        gamescope_announce_selection( pSelectionOffer->mimeTypes, eSelection );
+    }
+
+    template <typename Protocol>
+    void CWaylandBackend::OnDataControlFinished()
+    {
+        for ( SelectionState &selection : m_Selections )
+            DestroySelectionSource<Protocol>( selection.pOwnedSource.exchange( nullptr ) );
+
+        for ( uint32_t uSelection = 0; uSelection < GAMESCOPE_SELECTION_COUNT; uSelection++ )
+            ClearSelection( GamescopeSelection( uSelection ) );
+
+        if ( m_pDataDevice )
+        {
+            m_eSelectionTransport = SelectionTransport::Seat;
+            BindSeatPrimarySelection();
+            xdg_log.infof( "Host withdrew data control; falling back to the seat device for inbound selections." );
+        }
+        else
+        {
+            m_eSelectionTransport = SelectionTransport::Unavailable;
+            xdg_log.infof( "Host withdrew data control; selection sync is off." );
+        }
+    }
+
+    void CWaylandBackend::Wayland_ExtDataControlDevice_DataOffer( ext_data_control_device_v1 *pDevice, ext_data_control_offer_v1 *pOffer )
+    {
+        SelectionOffer *pSelectionOffer = new SelectionOffer{};
+        ext_data_control_offer_v1_add_listener( pOffer, &s_ExtDataControlOfferListener, pSelectionOffer );
+    }
+
+    void CWaylandBackend::Wayland_ExtDataControlOffer_Offer( void *pData, ext_data_control_offer_v1 *pOffer, const char *pMime )
+    {
+        ( (SelectionOffer *)pData )->mimeTypes.emplace_back( pMime );
+    }
+
+    void CWaylandBackend::Wayland_ExtDataControlDevice_Selection( ext_data_control_device_v1 *pDevice, ext_data_control_offer_v1 *pOffer )
+    {
+        OnDataControlOffer<ExtDataControlProtocol>( GAMESCOPE_SELECTION_CLIPBOARD, pOffer );
+    }
+
+    void CWaylandBackend::Wayland_ExtDataControlDevice_PrimarySelection( ext_data_control_device_v1 *pDevice, ext_data_control_offer_v1 *pOffer )
+    {
+        OnDataControlOffer<ExtDataControlProtocol>( GAMESCOPE_SELECTION_PRIMARY, pOffer );
+    }
+
+    void CWaylandBackend::Wayland_ExtDataControlDevice_Finished( ext_data_control_device_v1 *pDevice )
+    {
+        OnDataControlFinished<ExtDataControlProtocol>();
+
+        ext_data_control_device_v1_destroy( pDevice );
+        m_pExtDataControlDevice = nullptr;
+    }
+
+    void CWaylandBackend::Wayland_ExtDataControlSource_Send( ext_data_control_source_v1 *pSource, const char *pMime, int nFd )
+    {
+        SendSelectionSource( pSource, nFd );
+    }
+
+    void CWaylandBackend::Wayland_ExtDataControlSource_Cancelled( ext_data_control_source_v1 *pSource )
+    {
+        DisownSelectionSource( pSource );
+        ext_data_control_source_v1_destroy( pSource );
+    }
+
+    void CWaylandBackend::Wayland_WlrDataControlDevice_DataOffer( zwlr_data_control_device_v1 *pDevice, zwlr_data_control_offer_v1 *pOffer )
+    {
+        SelectionOffer *pSelectionOffer = new SelectionOffer{};
+        zwlr_data_control_offer_v1_add_listener( pOffer, &s_WlrDataControlOfferListener, pSelectionOffer );
+    }
+
+    void CWaylandBackend::Wayland_WlrDataControlOffer_Offer( void *pData, zwlr_data_control_offer_v1 *pOffer, const char *pMime )
+    {
+        ( (SelectionOffer *)pData )->mimeTypes.emplace_back( pMime );
+    }
+
+    void CWaylandBackend::Wayland_WlrDataControlDevice_Selection( zwlr_data_control_device_v1 *pDevice, zwlr_data_control_offer_v1 *pOffer )
+    {
+        OnDataControlOffer<WlrDataControlProtocol>( GAMESCOPE_SELECTION_CLIPBOARD, pOffer );
+    }
+
+    void CWaylandBackend::Wayland_WlrDataControlDevice_PrimarySelection( zwlr_data_control_device_v1 *pDevice, zwlr_data_control_offer_v1 *pOffer )
+    {
+        OnDataControlOffer<WlrDataControlProtocol>( GAMESCOPE_SELECTION_PRIMARY, pOffer );
+    }
+
+    void CWaylandBackend::Wayland_WlrDataControlDevice_Finished( zwlr_data_control_device_v1 *pDevice )
+    {
+        OnDataControlFinished<WlrDataControlProtocol>();
+
+        zwlr_data_control_device_v1_destroy( pDevice );
+        m_pWlrDataControlDevice = nullptr;
+    }
+
+    void CWaylandBackend::Wayland_WlrDataControlSource_Send( zwlr_data_control_source_v1 *pSource, const char *pMime, int nFd )
+    {
+        SendSelectionSource( pSource, nFd );
+    }
+
+    void CWaylandBackend::Wayland_WlrDataControlSource_Cancelled( zwlr_data_control_source_v1 *pSource )
+    {
+        DisownSelectionSource( pSource );
+        zwlr_data_control_source_v1_destroy( pSource );
     }
 
     ///////////////////////
