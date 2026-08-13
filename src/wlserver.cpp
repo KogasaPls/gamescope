@@ -70,6 +70,7 @@
 #include "Timeline.h"
 #include "Utils/Process.h"
 #include "Utils/PresentTiming.h"
+#include "xkb_modifier_helpers.hpp"
 
 #if HAVE_PIPEWIRE
 #include "pipewire.hpp"
@@ -2241,6 +2242,15 @@ static void wlserver_update_keymap()
 		wlserver_set_keyboard_keymap( &wlserver.keyboard_group->keyboard, keymap );
 		for ( struct wlserver_keyboard *pKeyboard : s_Keyboards )
 			wlserver_set_keyboard_keymap( pKeyboard->wlr, keymap );
+
+		// The stub virtual keyboard takes the *same* xkb_keymap object. wlr_keyboard
+		// leaves xkb_state null on a device with no keymap, which anything resolving a
+		// keysym through the seat's keyboard dereferences, and wlr_seat_set_keyboard()
+		// compares keymap pointers rather than contents (wlroots
+		// types/seat/wlr_seat_keyboard.c, needs_keymap_update), so sharing the object
+		// also costs no keymap resend when the stub is selected.
+		if ( wlserver.wlr.virtual_keyboard_device )
+			wlserver_set_keyboard_keymap( wlserver.wlr.virtual_keyboard_device, keymap );
 	}
 	else
 	{
@@ -2639,8 +2649,16 @@ void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain )
 		}
 	}
 
+	// Select the group keyboard, exactly as wlserver_key() does. The stub
+	// virtual device never carries modifier state, so selecting it here made
+	// wlr_seat_set_keyboard() and the enter below broadcast all-zero
+	// modifiers on every keyboard-focus change inside gamescope -- the exact
+	// symptom the modifier forwarding exists to fix.
 	assert( wlserver.wlr.virtual_keyboard_device != nullptr );
-	wlr_seat_set_keyboard( wlserver.wlr.seat, wlserver.wlr.virtual_keyboard_device );
+	wlr_keyboard *pFocusKeyboard = wlserver.keyboard_group
+		? &wlserver.keyboard_group->keyboard
+		: wlserver.wlr.virtual_keyboard_device;
+	wlr_seat_set_keyboard( wlserver.wlr.seat, pFocusKeyboard );
 
 	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard( wlserver.wlr.seat );
 	if ( keyboard == nullptr )
@@ -2722,11 +2740,55 @@ bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press 
 	return false;
 }
 
+void wlserver_modifiers( struct xkb_keymap *pSourceKeymap, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group )
+{
+	assert( wlserver_is_lock_held() );
+
+	if ( !wlserver.keyboard_group )
+		return;
+
+	struct wlr_keyboard *keyboard = &wlserver.keyboard_group->keyboard;
+	struct xkb_keymap *pDestKeymap = keyboard->keymap;
+	const bool bTranslate = pSourceKeymap && pDestKeymap;
+
+	// The group keyboard compiles its own keymap, so the source's indices carry
+	// over by name. Without both keymaps only the eight core modifiers, which
+	// every keymap keeps at the same indices, can be trusted.
+	auto fnTranslateMask = [&]( uint32_t uMask ) -> uint32_t
+	{
+		if ( !bTranslate )
+			return uMask & 0xff;
+
+		return gamescope::xkb_modifiers::TranslateMask( uMask,
+			[&]( uint32_t uIndex ) { return xkb_keymap_mod_get_name( pSourceKeymap, uIndex ); },
+			[&]( const char *pszName ) { return xkb_keymap_mod_get_index( pDestKeymap, pszName ); } );
+	};
+
+	// A source layout the group keyboard lacks leaves its own layout alone.
+	uint32_t uGroup = keyboard->modifiers.group;
+	if ( bTranslate )
+	{
+		uGroup = gamescope::xkb_modifiers::TranslateIndex( group,
+			[&]( uint32_t uIndex ) { return xkb_keymap_layout_get_name( pSourceKeymap, uIndex ); },
+			[&]( const char *pszName ) { return xkb_keymap_layout_get_index( pDestKeymap, pszName ); },
+			xkb_keymap_num_layouts( pDestKeymap ) ).value_or( uGroup );
+	}
+
+	// wlr_keyboard_notify_modifiers emits keyboard->events.modifiers, bound
+	// to wlserver_handle_modifiers, which already does the seat set/notify
+	// and bumps the input counter. Repeating them here sent two identical
+	// wl_keyboard.modifiers broadcasts and woke steamcompmgr twice per host
+	// modifier event.
+	wlr_keyboard_notify_modifiers( keyboard, fnTranslateMask( depressed ), fnTranslateMask( latched ), fnTranslateMask( locked ), uGroup );
+}
+
 void wlserver_key( uint32_t key, bool press, uint32_t time )
 {
 	assert( wlserver_is_lock_held() );
 
-	wlr_keyboard *keyboard = wlserver.wlr.virtual_keyboard_device;
+	wlr_keyboard *keyboard = wlserver.keyboard_group
+		? &wlserver.keyboard_group->keyboard
+		: wlserver.wlr.virtual_keyboard_device;
 
 	if ( !wlserver_process_hotkeys( keyboard, key, press ) )
 	{
@@ -2742,9 +2804,16 @@ void wlserver_keyboard_modifiers( uint32_t depressed, uint32_t latched, uint32_t
 {
 	assert( wlserver_is_lock_held() );
 
-	wlr_keyboard *keyboard = wlserver.wlr.virtual_keyboard_device;
+	wlr_keyboard *keyboard = wlserver.keyboard_group
+		? &wlserver.keyboard_group->keyboard
+		: wlserver.wlr.virtual_keyboard_device;
 	if ( keyboard->keymap && group >= xkb_keymap_num_layouts( keyboard->keymap ) )
 		group = 0;
+	if ( wlserver.keyboard_group )
+	{
+		wlr_keyboard_notify_modifiers( keyboard, depressed, latched, locked, group );
+		return;
+	}
 	keyboard->modifiers = { .depressed = depressed, .latched = latched, .locked = locked, .group = group };
 
 	if ( wlserver.wlr.seat->keyboard_state.keyboard == keyboard )
@@ -2755,7 +2824,9 @@ void wlserver_keyboard_modifiers( uint32_t depressed, uint32_t latched, uint32_t
 
 void wlserver_keyboard_release_modifiers()
 {
-	const wlr_keyboard_modifiers &mods = wlserver.wlr.virtual_keyboard_device->modifiers;
+	const wlr_keyboard_modifiers &mods = wlserver.keyboard_group
+		? wlserver.keyboard_group->keyboard.modifiers
+		: wlserver.wlr.virtual_keyboard_device->modifiers;
 	wlserver_keyboard_modifiers( 0, 0, mods.locked, mods.group );
 }
 
