@@ -331,6 +331,19 @@ namespace gamescope
             }
 		}
 
+        virtual uint32_t GetOutputRingDepth() const override
+        {
+            {
+                std::shared_lock lock{ m_mutInit };
+                if ( m_bInittedChild )
+                    return m_pChild->GetOutputRingDepth();
+            }
+
+            // The main loop remakes the ring when the depth changes, so a child
+            // that appears later corrects this.
+            return 4;
+        }
+
         virtual std::optional<app_viewport::Rect> GetCaptureRegion() const override
         {
             {
