@@ -276,6 +276,18 @@ namespace gamescope
         virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) = 0;
         virtual void SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection ) = 0;
 
+        // Ask the host for eSelection's bytes as pszMimeType, which the host
+        // offer advertised. False when this backend has no host selection to
+        // fetch, which is the answer for every backend that copies the host's
+        // selection in eagerly; on true the bytes arrive later through
+        // gamescope_deliver_selection_fetch(), carrying ulEpoch back so a fetch
+        // that outlives its announcement answers nothing.
+        virtual bool FetchHostSelection( GamescopeSelection eSelection, const char *pszMimeType, uint64_t ulEpoch ) { return false; }
+        // The MIME types of the host offer behind eSelection, for a session that
+        // has lost the owner it handed the selection to. False when there is no
+        // host offer left to announce.
+        virtual bool GetHostSelectionMimeTypes( GamescopeSelection eSelection, std::vector<std::string> &mimeTypes ) { return false; }
+
         virtual bool ShouldPaintCursor() { return false; }
     };
 
