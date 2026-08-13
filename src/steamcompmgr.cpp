@@ -40,6 +40,7 @@
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <tuple>
 #include <condition_variable>
 #include <mutex>
 #include <atomic>
@@ -1057,7 +1058,8 @@ struct global_focus_t : public focus_t
 std::unordered_map<gamescope::VirtualConnectorKey_t, global_focus_t> g_VirtualConnectorFocuses;
 global_focus_t *GetCurrentFocus()
 {
-	uint64_t ulKey = GetBackend()->GetCurrentConnector() ? GetBackend()->GetCurrentConnector()->GetVirtualConnectorKey() : 0;
+	auto *pConnector = GetBackend()->GetCurrentConnector();
+	uint64_t ulKey = pConnector ? pConnector->GetVirtualConnectorKey() : 0;
 
 	auto iter = g_VirtualConnectorFocuses.find( ulKey );
 	if ( iter != g_VirtualConnectorFocuses.end() )
@@ -2989,7 +2991,48 @@ static void carry_override_underlay( focus_t *pFocus, steamcompmgr_win_t *pPrevi
 // Synthetic focus for the capture stream, connector fields never populated.
 static global_focus_t s_PipewireFocus{};
 
-static void paint_pipewire()
+static global_focus_t *get_pipewire_focus( uint64_t ulFocusAppId )
+{
+	global_focus_t *pFocus = nullptr;
+	if ( ulFocusAppId )
+	{
+		static uint64_t s_ulLastFocusAppId = 0;
+
+		bool bAppIdChange = ulFocusAppId != s_ulLastFocusAppId;
+		if ( bAppIdChange )
+		{
+			xwm_log.infof( "Exposing appid %lu (%u 32-bit) focus-wise on pipewire stream.", ulFocusAppId, uint32_t( ulFocusAppId ) );
+			s_ulLastFocusAppId = ulFocusAppId;
+		}
+
+		const uint64_t ulFocusSerial = GetFocusSerial();
+		if ( s_PipewireFocus.ulCurrentFocusSerial != ulFocusSerial || bAppIdChange )
+		{
+			std::vector<steamcompmgr_win_t *> vecPossibleFocusWindows = GetGlobalPossibleFocusWindows();
+
+			steamcompmgr_win_t *pPreviousOverride = s_PipewireFocus.overrideWindow;
+			std::vector<steamcompmgr_win_t*> vecPreviousUnderlays = s_PipewireFocus.overrideUnderlayWindows;
+
+			std::vector<uint32_t> vecAppIds{ uint32_t( ulFocusAppId ) };
+			s_PipewireFocus.focusWindow = nullptr;
+			pick_primary_focus_and_override( &s_PipewireFocus, None, vecPossibleFocusWindows, false, vecAppIds, 0, gamescope::VirtualConnectorStrategies::SteamControlled );
+			pick_decoration_windows( &s_PipewireFocus );
+			carry_override_underlay( &s_PipewireFocus, pPreviousOverride, vecPreviousUnderlays );
+			s_PipewireFocus.ulCurrentFocusSerial = ulFocusSerial;
+		}
+		pFocus = &s_PipewireFocus;
+	}
+	else
+	{
+		pFocus = GetCurrentFocus();
+	}
+
+	if ( !pFocus || !pFocus->focusWindow || ( ulFocusAppId && pFocus->focusWindow->appID != ulFocusAppId ) )
+		return nullptr;
+	return pFocus;
+}
+
+static void paint_pipewire( uint64_t ulFocusAppId, global_focus_t *pFocus, std::optional<gamescope::app_viewport::Rect> oCaptureRegion )
 {
 	static struct pipewire_buffer *s_pPipewireBuffer = nullptr;
 	const uint64_t ulCaptureGeneration = pipewire_capture_generation();
@@ -3006,7 +3049,8 @@ static void paint_pipewire()
 	if ( !s_pPipewireBuffer )
 		s_pPipewireBuffer = dequeue_pipewire_buffer();
 
-	if ( !s_pPipewireBuffer || !s_pPipewireBuffer->texture )
+	if ( !s_pPipewireBuffer || !s_pPipewireBuffer->texture || !pFocus ||
+	     s_pPipewireBuffer->gamescope_info.focus_appid != ulFocusAppId )
 		return;
 
 	struct FrameInfo_t frameInfo = {};
@@ -3016,7 +3060,7 @@ static void paint_pipewire()
 	frameInfo.bFadingOut           = false;
 
 	const UpscaleSettings_t upscaleSettings = GetUpscaleSettings(
-		GetCurrentFocus() && window_is_steam( GetCurrentFocus()->focusWindow ),
+		window_is_steam( pFocus->focusWindow ),
 		g_wantedUpscaleFilter,
 		g_wantedUpscaleScaler,
 		g_upscaleFilterSharpness );
@@ -3031,46 +3075,6 @@ static void paint_pipewire()
 		frameInfo.shaperLut[nInputEOTF] = g_ScreenshotColorMgmtLuts[nInputEOTF].vk_lut1d;
 	}
 
-	const uint64_t ulFocusAppId = s_pPipewireBuffer->gamescope_info.focus_appid;
-
-	global_focus_t *pFocus = nullptr;
-	if ( ulFocusAppId )
-	{
-		static uint64_t s_ulLastFocusAppId = 0;
-
-		bool bAppIdChange = ulFocusAppId != s_ulLastFocusAppId;
-		if ( bAppIdChange )
-		{
-			xwm_log.infof( "Exposing appid %lu (%u 32-bit) focus-wise on pipewire stream.", ulFocusAppId, uint32_t( ulFocusAppId ) );
-			s_ulLastFocusAppId = ulFocusAppId;
-		}
-
-		if ( s_PipewireFocus.IsDirty() || bAppIdChange )
-		{
-			std::vector<steamcompmgr_win_t *> vecPossibleFocusWindows = GetGlobalPossibleFocusWindows();
-
-			steamcompmgr_win_t *pPreviousOverride = s_PipewireFocus.overrideWindow;
-			std::vector<steamcompmgr_win_t*> vecPreviousUnderlays = s_PipewireFocus.overrideUnderlayWindows;
-
-			std::vector<uint32_t> vecAppIds{ uint32_t( ulFocusAppId ) };
-			pick_primary_focus_and_override( &s_PipewireFocus, None, vecPossibleFocusWindows, false, vecAppIds, 0, gamescope::VirtualConnectorStrategies::SteamControlled );
-			pick_decoration_windows( &s_PipewireFocus );
-			carry_override_underlay( &s_PipewireFocus, pPreviousOverride, vecPreviousUnderlays );
-		}
-		pFocus = &s_PipewireFocus;
-	}
-	else
-	{
-		pFocus = GetCurrentFocus();
-	}
-
-	if ( !pFocus->focusWindow )
-		return;
-
-	const bool bAppIdMatches = !ulFocusAppId || pFocus->focusWindow->appID == ulFocusAppId;
-	if ( !bAppIdMatches )
-		return;
-
 	uint64_t ulFocusCommitId = window_last_done_commit_id( pFocus->focusWindow );
 	uint64_t ulOverrideCommitId = window_last_done_commit_id( pFocus->overrideWindow );
 	// Combine the underlay and decoration commits so damage to any of them, or a change
@@ -3084,9 +3088,10 @@ static void paint_pipewire()
 		ulDecorationCommitId = ulDecorationCommitId * 31 + window_last_done_commit_id( decoration );
 
 	// A new consumer or buffer format needs a first frame even on a static desktop.
-	const std::array captureFrame = { ulCaptureGeneration, s_pPipewireBuffer->format_generation,
-		ulFocusCommitId, ulOverrideCommitId, ulUnderlayCommitId, ulDecorationCommitId };
-	static std::optional<std::array<uint64_t, 6>> lastSubmittedFrame;
+	auto captureFrame = std::tuple{ ulCaptureGeneration, s_pPipewireBuffer->format_generation,
+		ulFocusCommitId, ulOverrideCommitId, ulUnderlayCommitId, ulDecorationCommitId,
+		oCaptureRegion, currentOutputWidth, currentOutputHeight };
+	static std::optional<decltype(captureFrame)> lastSubmittedFrame;
 	if ( lastSubmittedFrame == captureFrame )
 		return;
 
@@ -3100,6 +3105,17 @@ static void paint_pipewire()
 	g_uCompositeDebug = 0;
 	currentOutputWidth = uWidth;
 	currentOutputHeight = uHeight;
+
+	// A backend that shows part of the output gets that part in the stream:
+	// the scene is laid out on the whole output and the shown part shifted to
+	// the buffer's origin.
+	std::optional<gamescope::app_viewport::CaptureLayout> oCropLayout;
+	if ( oCaptureRegion )
+	{
+		oCropLayout = gamescope::app_viewport::ComputeCaptureLayout( *oCaptureRegion, uBackupWidth, uBackupHeight, uWidth, uHeight );
+		currentOutputWidth = oCropLayout->uCanvasWidth;
+		currentOutputHeight = oCropLayout->uCanvasHeight;
+	}
 
 	// Paint the windows we have onto the Pipewire stream.
 	steamcompmgr_win_t *fit = pFocus->overrideWindow;
@@ -3133,6 +3149,19 @@ static void paint_pipewire()
 	{
 		paint_window( pFocus, pFocus->overlayWindow, pFocus->overlayWindow, &frameInfo, nullptr, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter |
 				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 )  );
+	}
+
+	if ( oCropLayout )
+	{
+		for ( int i = 0; i < frameInfo.layers.count(); i++ )
+		{
+			frameInfo.layers.get( i ).offset.x += oCropLayout->flOriginX;
+			frameInfo.layers.get( i ).offset.y += oCropLayout->flOriginY;
+		}
+
+		// vulkan_screenshot dispatches over the current output size.
+		currentOutputWidth = uWidth;
+		currentOutputHeight = uHeight;
 	}
 
 	gamescope::Rc<CVulkanTexture> pRGBTexture = s_pPipewireBuffer->texture->isYcbcr()
@@ -10433,6 +10462,9 @@ steamcompmgr_main(int argc, char **argv)
 					g_FadeOutDuration = atoi(optarg);
 				} else if (strcmp(opt_name, "force-windows-fullscreen") == 0) {
 					bForceWindowsFullscreen = true;
+				} else if (strcmp(opt_name, "track-app-size") == 0) {
+					g_bTrackAppSize = true;
+					g_flMaxWindowScale = 1.0f;
 				} else if (strcmp(opt_name, "hdr-enabled") == 0 || strcmp(opt_name, "hdr-enable") == 0) {
 					cv_hdr_enabled = true;
 				} else if (strcmp(opt_name, "hdr-debug-force-support") == 0) {
@@ -11360,9 +11392,15 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 #if HAVE_PIPEWIRE
+		const uint64_t ulCaptureAppId = pipewire_focus_appid();
+		global_focus_t *pCaptureFocus = get_pipewire_focus( ulCaptureAppId );
+		const auto oCaptureRegion = gamescope::app_viewport::CaptureRegionForFocus(
+			g_VirtualConnectorFocuses, pCaptureFocus, ulCaptureAppId != 0, gamescope::cv_backend_virtual_connector_strategy.Get() );
+		pipewire_set_capture_crop_size( oCaptureRegion ? oCaptureRegion->uWidth : 0, oCaptureRegion ? oCaptureRegion->uHeight : 0 );
+
 		// Drive on vblank, not the timer: under VRR the timer starves (page flips re-arm it).
 		if ( vblank && pipewire_is_streaming() && pipewire_capture_frame_due( GetVBlankTimer().GetRefresh() ) )
-			paint_pipewire();
+			paint_pipewire( ulCaptureAppId, pCaptureFocus, oCaptureRegion );
 #endif
 
 		update_vrr_atoms(root_ctx, false, &flush_root);
