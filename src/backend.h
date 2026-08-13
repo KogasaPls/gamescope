@@ -8,6 +8,7 @@
 #include "rc.h"
 #include "drm_include.h"
 #include "Utils/Algorithm.h"
+#include "app_viewport_helpers.hpp"
 
 #include <cassert>
 #include <span>
@@ -206,6 +207,9 @@ namespace gamescope
         virtual BackendPresentFeedback& PresentationFeedback() = 0;
 
         virtual uint64_t GetVirtualConnectorKey() const = 0;
+
+        // The visible crop in output pixels. Read only on the compositor thread.
+        virtual std::optional<app_viewport::Rect> GetCaptureRegion() const { return std::nullopt; }
 
         // A stand-in connector with no display behind it, e.g. the DRM headless virtual screen.
         virtual bool IsHeadless() const { return false; }
