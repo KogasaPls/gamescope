@@ -16,6 +16,7 @@
 
 #include <cstring>
 #include <unordered_map>
+#include <shared_mutex>
 #include <unordered_set>
 #include <csignal>
 #include <sys/mman.h>
@@ -481,6 +482,7 @@ namespace gamescope
         void SetHostCompositorIsCurrentlyVRR( bool bActive ) { m_bHostCompositorIsCurrentlyVRR = bActive; }
         bool CurrentDisplaySupportsVRR() const { return HostCompositorIsCurrentlyVRR(); }
         CWaylandBackend *GetBackend() const { return m_pBackend; }
+        wl_surface *GetToplevelSurface() const { return m_Planes[0].GetSurface(); }
 
         /////////////////////
         // IBackendConnector
@@ -613,10 +615,24 @@ namespace gamescope
         std::shared_ptr<T> QueueLaunder( T* pObject );
 
         void SetRelativePointer( bool bRelative );
+        // The input thread holds this shared across every dispatch of its queue,
+        // and connector teardown takes it exclusively, so a handler sees either a
+        // live proxy or one libwayland has already nulled.
+        std::shared_mutex m_mutCursorSurface;
+        void ForgetSurface( wl_surface *pSurface );
+
+        std::unique_lock<std::shared_mutex> LockDispatch()
+        {
+            // The caller must not hold the wlserver lock: handlers take it while
+            // holding this one shared, so taking this exclusively under it deadlocks.
+            return std::unique_lock{ m_mutCursorSurface };
+        }
 
     private:
 
         void HandleKey( uint32_t uKey, bool bPressed );
+        void UpdateRelativePointer();
+        void ReleaseHeldKeys();
 
         CWaylandBackend *m_pBackend = nullptr;
 
@@ -637,6 +653,8 @@ namespace gamescope
         wl_pointer *m_pPointer = nullptr;
         wl_touch *m_pTouch = nullptr;
         zwp_relative_pointer_manager_v1 *m_pRelativePointerManager = nullptr;
+        std::atomic<bool> m_bRelativePointerRequested = { false };
+        std::atomic<bool> m_bPendingRelativePointerUpdate = { false };
 
         uint32_t m_uFakeTimestamp = 0;
 
@@ -649,7 +667,9 @@ namespace gamescope
         double m_flScrollAccum[2] = { 0.0, 0.0 };
         uint32_t m_uAxisSource = WL_POINTER_AXIS_SOURCE_WHEEL;
 
-		wl_surface *m_pCurrentCursorSurface = nullptr;
+		// Cleared by the main thread when the connector that owns the surface
+		// goes away, ahead of the surface being destroyed.
+		std::atomic<wl_surface *> m_pCurrentCursorSurface = nullptr;
 
         std::optional<wl_fixed_t> m_ofPendingCursorX;
         std::optional<wl_fixed_t> m_ofPendingCursorY;
@@ -793,6 +813,8 @@ namespace gamescope
 
         void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info );
         void SetRelativeMouseMode( wl_surface *pSurface, bool bRelative );
+        void UpdateRelativeMouseMode();
+        void DestroyRelativeMouseMode();
         void UpdateCursor();
 
         friend CWaylandConnector;
@@ -847,13 +869,27 @@ namespace gamescope
 
         void OnConnectorDestroyed( CWaylandConnector *pConnector )
         {
+            wl_surface *pSurface = pConnector->GetToplevelSurface();
+
             CWaylandConnector *pExpected = pConnector;
             m_pFocusConnector.compare_exchange_strong( pExpected, nullptr );
             m_uConnectorCount--;
 
             if ( pConnector->IsCroppingOutput() )
                 SetCaptureExtent( 0, 0 );
+
+            if ( pSurface )
+                m_InputThread.ForgetSurface( pSurface );
+
+            if ( pSurface && ( pSurface == m_pRequestedRelativeSurface || pSurface == m_pLockedSurface ) )
+            {
+                m_pRequestedRelativeSurface = nullptr;
+                DestroyRelativeMouseMode();
+                m_InputThread.SetRelativePointer( false );
+            }
         }
+
+        std::unique_lock<std::shared_mutex> LockInputDispatch() { return m_InputThread.LockDispatch(); }
 
     private:
 
@@ -961,6 +997,7 @@ namespace gamescope
         zwp_locked_pointer_v1 *m_pLockedPointer = nullptr;
 		bool m_bPointerLocked = false;
         wl_surface *m_pLockedSurface = nullptr;
+        wl_surface *m_pRequestedRelativeSurface = nullptr;
         zwp_relative_pointer_v1 *m_pRelativePointer = nullptr;
 
         bool m_bCanUseModifiers = false;
@@ -1509,7 +1546,7 @@ namespace gamescope
     void CWaylandConnector::SetRelativeMouseMode( bool bRelative )
     {
         // TODO: Do more tracking across multiple connectors, and activity here if we ever want to use this.
-        m_pBackend->SetRelativeMouseMode( m_Planes[0].GetSurface(), bRelative );
+        m_pBackend->SetRelativeMouseMode( GetToplevelSurface(), bRelative );
     }
     void CWaylandConnector::SetVisible( bool bVisible )
     {
@@ -2811,36 +2848,51 @@ namespace gamescope
     }
     void CWaylandBackend::SetRelativeMouseMode( wl_surface *pSurface, bool bRelative )
     {
-        if ( !m_pPointer )
+        m_pRequestedRelativeSurface = bRelative ? pSurface : nullptr;
+        UpdateRelativeMouseMode();
+        m_InputThread.SetRelativePointer( bRelative );
+    }
+
+    void CWaylandBackend::DestroyRelativeMouseMode()
+    {
+        const bool bHadRelativeMode = m_pLockedPointer || m_pRelativePointer;
+        if ( !bHadRelativeMode )
             return;
 
-        if ( !!bRelative != !!m_pLockedPointer || ( pSurface != m_pLockedSurface && bRelative ) )
+        if ( m_pLockedPointer )
         {
-            if ( m_pLockedPointer )
-            {
-                assert( m_pRelativePointer );
+            zwp_locked_pointer_v1_destroy( m_pLockedPointer );
+            m_pLockedPointer = nullptr;
+        }
 
-                zwp_locked_pointer_v1_destroy( m_pLockedPointer );
-                m_pLockedPointer = nullptr;
-                m_bPointerLocked = false;
+        m_bPointerLocked = false;
 
-                zwp_relative_pointer_v1_destroy( m_pRelativePointer );
-                m_pRelativePointer = nullptr;
+        if ( m_pRelativePointer )
+        {
+            zwp_relative_pointer_v1_destroy( m_pRelativePointer );
+            m_pRelativePointer = nullptr;
+        }
 
-                m_pLockedSurface = nullptr;
-            }
+        m_pLockedSurface = nullptr;
+    }
+
+    void CWaylandBackend::UpdateRelativeMouseMode()
+    {
+        const bool bRelative = m_pRequestedRelativeSurface && m_pPointer;
+
+        if ( !!bRelative != !!m_pLockedPointer || ( m_pRequestedRelativeSurface != m_pLockedSurface && bRelative ) )
+        {
+            DestroyRelativeMouseMode();
 
 			if ( bRelative )
 			{
-				m_pLockedPointer = zwp_pointer_constraints_v1_lock_pointer( m_pPointerConstraints, pSurface, m_pPointer, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
+				m_pLockedPointer = zwp_pointer_constraints_v1_lock_pointer( m_pPointerConstraints, m_pRequestedRelativeSurface, m_pPointer, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
 				zwp_locked_pointer_v1_add_listener( m_pLockedPointer, &s_LockedPointerListener, this );
 
 				m_pRelativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer( m_pRelativePointerManager, m_pPointer );
 
-				m_pLockedSurface = pSurface;
+				m_pLockedSurface = m_pRequestedRelativeSurface;
 			}
-
-            m_InputThread.SetRelativePointer( bRelative );
 
             UpdateCursor();
         }
@@ -3030,13 +3082,17 @@ namespace gamescope
         {
             if ( m_pPointer )
             {
+                DestroyRelativeMouseMode();
                 wl_pointer_release( m_pPointer );
                 m_pPointer = nullptr;
+                m_bMouseEntered = false;
+                m_uPointerEnterSerial = 0;
             }
             else
             {
                 m_pPointer = wl_seat_get_pointer( m_pSeat );
                 wl_pointer_add_listener( m_pPointer, &s_PointerListener, this );
+                UpdateRelativeMouseMode();
             }
         }
 
@@ -3263,10 +3319,17 @@ namespace gamescope
         int nRet = 0;
         while ( m_Waiter.IsRunning() )
         {
-            if ( ( nRet = wl_display_dispatch_queue_pending( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
             {
-                LogDisplayError( "Failed to dispatch input thread queue", m_pBackend->GetDisplay() );
-                abort();
+                std::shared_lock dispatchLock{ m_mutCursorSurface };
+
+                if ( ( nRet = wl_display_dispatch_queue_pending( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
+                {
+                    LogDisplayError( "Failed to dispatch input thread queue", m_pBackend->GetDisplay() );
+                    abort();
+                }
+
+                if ( m_bPendingRelativePointerUpdate.exchange( false ) )
+                    UpdateRelativePointer();
             }
 
             if ( ( nRet = wl_display_prepare_read_queue( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
@@ -3313,11 +3376,27 @@ namespace gamescope
         return std::shared_ptr<T>{ pObjectWrapper, []( T *pThing ){ wl_proxy_wrapper_destroy( (void *)pThing ); } };
     }
 
+    void CWaylandInputThread::ForgetSurface( wl_surface *pSurface )
+    {
+        std::unique_lock lock = LockDispatch();
+
+        wl_surface *pExpected = pSurface;
+        m_pCurrentCursorSurface.compare_exchange_strong( pExpected, nullptr );
+    }
+
     void CWaylandInputThread::SetRelativePointer( bool bRelative )
     {
+        m_bRelativePointerRequested = bRelative;
+        m_bPendingRelativePointerUpdate = true;
+        m_Waiter.Nudge();
+    }
+
+    void CWaylandInputThread::UpdateRelativePointer()
+    {
+        const bool bRelative = m_bRelativePointerRequested.load() && m_pPointer && m_pRelativePointerManager;
         if ( bRelative == !!m_pRelativePointer.load() )
             return;
-        // This constructors/destructors the display's mutex, so should be safe to do across threads.
+
         if ( !bRelative )
         {
             m_pRelativePointer = nullptr;
@@ -3443,13 +3522,30 @@ namespace gamescope
         {
             if ( m_pPointer )
             {
-                wl_pointer_release( m_pPointer );
+                wlserver_lock();
+                wlserver_pointer_left();
+                wlserver_unlock();
+
+                wl_pointer *pPointer = m_pPointer;
                 m_pPointer = nullptr;
+                UpdateRelativePointer();
+                wl_pointer_release( pPointer );
+
+                m_ofPendingCursorX.reset();
+                m_ofPendingCursorY.reset();
+                m_pCurrentCursorSurface = nullptr;
+                m_bMouseEntered = false;
+                m_uPointerEnterSerial = 0;
+                m_flScrollAccum[0] = 0.0;
+                m_flScrollAccum[1] = 0.0;
+                m_uAxisSource = WL_POINTER_AXIS_SOURCE_WHEEL;
             }
             else
             {
-                m_pPointer = wl_seat_get_pointer( m_pSeat );
-                wl_pointer_add_listener( m_pPointer, &s_PointerListener, this );
+                wl_pointer *pPointer = wl_seat_get_pointer( m_pSeat );
+                wl_pointer_add_listener( pPointer, &s_PointerListener, this );
+                m_pPointer = pPointer;
+                UpdateRelativePointer();
             }
         }
 
@@ -3457,6 +3553,8 @@ namespace gamescope
         {
             if ( m_pKeyboard )
             {
+                ReleaseHeldKeys();
+
                 wl_keyboard_release( m_pKeyboard );
                 m_pKeyboard = nullptr;
             }
@@ -3488,6 +3586,11 @@ namespace gamescope
 	}
 	void CWaylandInputThread::Wayland_Pointer_Leave( wl_pointer *pPointer, uint32_t uSerial, wl_surface *pSurface )
 	{
+		// wlroots forgets held buttons when its pointer focus changes surface, and the leave precedes that.
+		wlserver_lock();
+		wlserver_pointer_left();
+		wlserver_unlock();
+
 		if ( !IsGamescopeToplevel( pSurface ) )
 			return;
 
@@ -3500,7 +3603,11 @@ namespace gamescope
 		if ( !m_bMouseEntered )
 			return;
 
-		CWaylandPlane *pPlane = (CWaylandPlane *)wl_surface_get_user_data( m_pCurrentCursorSurface );
+		wl_surface *pCursorSurface = m_pCurrentCursorSurface.load();
+		if ( !pCursorSurface )
+			return;
+
+		CWaylandPlane *pPlane = (CWaylandPlane *)wl_surface_get_user_data( pCursorSurface );
 
 		if ( !pPlane )
 			return;
@@ -3534,12 +3641,13 @@ namespace gamescope
         // Ignore any pointer events for which the `enter` event surface didn't pass `IsGamescopeToplevel` (libdecor frame)
         if ( !m_bMouseEntered )
             return;
+        const bool bPressed = uState == WL_POINTER_BUTTON_STATE_PRESSED;
         // Don't do any motion/movement stuff if we don't have kb focus
-        if ( !cv_wayland_mouse_warp_without_keyboard_focus && !m_bKeyboardEntered )
+        if ( bPressed && !cv_wayland_mouse_warp_without_keyboard_focus && !m_bKeyboardEntered )
             return;
 
         wlserver_lock();
-        wlserver_mousebutton( uButton, uState == WL_POINTER_BUTTON_STATE_PRESSED, ++m_uFakeTimestamp );
+        wlserver_mousebutton( uButton, bPressed, ++m_uFakeTimestamp );
         wlserver_unlock();
     }
     void CWaylandInputThread::Wayland_Pointer_Axis( wl_pointer *pPointer, uint32_t uTime, uint32_t uAxis, wl_fixed_t fValue )
@@ -3664,12 +3772,8 @@ namespace gamescope
             m_ofPendingCursorY = std::nullopt;
         }
     }
-    void CWaylandInputThread::Wayland_Keyboard_Leave( wl_keyboard *pKeyboard, uint32_t uSerial, wl_surface *pSurface )
+    void CWaylandInputThread::ReleaseHeldKeys()
     {
-		if ( !IsGamescopeToplevel( pSurface ) )
-			return;
-
-        m_bKeyboardEntered = false;
         m_uKeyModifiers = 0;
 
         // Clear the group keyboard's modifiers too, symmetric with the
@@ -3683,6 +3787,11 @@ namespace gamescope
             HandleKey( uKey, false );
 
         m_uScancodesHeld.clear();
+        m_bKeyboardEntered = false;
+    }
+    void CWaylandInputThread::Wayland_Keyboard_Leave( wl_keyboard *pKeyboard, uint32_t uSerial, wl_surface *pSurface )
+    {
+        ReleaseHeldKeys();
     }
     void CWaylandInputThread::Wayland_Keyboard_Key( wl_keyboard *pKeyboard, uint32_t uSerial, uint32_t uTime, uint32_t uKey, uint32_t uState )
     {
@@ -3718,7 +3827,7 @@ namespace gamescope
     void CWaylandInputThread::Wayland_RelativePointer_RelativeMotion( zwp_relative_pointer_v1 *pRelativePointer, uint32_t uTimeHi, uint32_t uTimeLo, wl_fixed_t fDx, wl_fixed_t fDy, wl_fixed_t fDxUnaccel, wl_fixed_t fDyUnaccel )
     {
 		// Don't do any motion/movement stuff if we don't have kb focus
-		if ( !m_pBackend->m_bPointerLocked || ( !cv_wayland_mouse_relmotion_without_keyboard_focus && !m_bKeyboardEntered ) )
+		if ( !cv_wayland_mouse_relmotion_without_keyboard_focus && !m_bKeyboardEntered )
 			return;
 
         wlserver_lock();
