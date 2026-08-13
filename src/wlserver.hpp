@@ -135,6 +135,14 @@ struct wlserver_t {
 	} wlr;
 	
 	struct wlr_surface *mouse_focus_surface;
+	struct
+	{
+		struct wlr_surface *pSurface = nullptr;
+		int nX = 0;
+		int nY = 0;
+		bool bPending = false;
+	} pending_mouse_focus;
+	uint32_t last_pointer_button_time = 0;
 	struct wlr_surface *kb_focus_surface;
 	std::unordered_map<struct wlr_surface *, std::pair<int, int>> current_dropdown_surfaces;
 	double mouse_surface_cursorx = 0.0f;
@@ -271,6 +279,7 @@ void wlserver_mousemotion( double x, double y, uint32_t time );
 void wlserver_mousehide();
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic );
 void wlserver_mousebutton( int button, bool press, uint32_t time );
+void wlserver_pointer_left();
 void wlserver_mousewheel( double x, double y, uint32_t time );
 bool wlserver_input_held();
 void wlserver_drag_anchor_move( struct wlr_surface *surface, int x, int y, int base_x, int base_y );
