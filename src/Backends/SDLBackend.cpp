@@ -22,6 +22,7 @@
 #include "refresh_rate.h"
 
 #include "sdlscancodetable.hpp"
+#include "window_icon.hpp"
 
 static int g_nOldNestedRefresh = 0;
 static bool g_bWindowFocused = true;
@@ -917,15 +918,18 @@ namespace gamescope
 							m_pIconSurface = nullptr;
 						}
 
-						if ( pIcon && pIcon->size() >= 3 )
+						std::optional<window_icon::WindowIcon> oIcon;
+						if ( pIcon )
+							oIcon = window_icon::ParseWindowIcon( *pIcon );
+
+						if ( oIcon )
 						{
-							const uint32_t uWidth = (*pIcon)[0];
-							const uint32_t uHeight = (*pIcon)[1];
+							const size_t uPixelOffset = size_t( oIcon->pixels.data() - pIcon->data() );
 
 							m_pIconSurface = SDL_CreateRGBSurfaceFrom(
-								&(*pIcon)[2],
-								uWidth, uHeight,
-								32, uWidth * sizeof(uint32_t),
+								pIcon->data() + uPixelOffset,
+								int( oIcon->uWidth ), int( oIcon->uHeight ),
+								32, int( oIcon->uWidth * sizeof(uint32_t) ),
 								0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
 						}
 
