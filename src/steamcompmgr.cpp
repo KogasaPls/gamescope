@@ -3838,7 +3838,10 @@ bool get_prop( xwayland_ctx_t *ctx, Window win, Atom prop, std::vector< uint32_t
 	int result = XGetWindowProperty(ctx->dpy, win, prop, 0L, ~0UL, false,
 									XA_CARDINAL, &actual, &format,
 									&n, &left, ( unsigned char** )&data);
-	if (result == Success && data != NULL)
+	// Xlib returns an array of long only for format 32; a client is free to set
+	// a CARDINAL property with format 8 or 16, and reading that as 64-bit words
+	// walks off the end of the buffer.
+	if (result == Success && data != NULL && format == 32)
 	{
 		for ( uint32_t i = 0; i < n; i++ )
 		{
@@ -3847,6 +3850,8 @@ bool get_prop( xwayland_ctx_t *ctx, Window win, Atom prop, std::vector< uint32_t
 		XFree((void *) data);
 		return true;
 	}
+	if (data != NULL)
+		XFree((void *) data);
 	return false;
 }
 
