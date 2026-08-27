@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "wayland_scale_helpers.hpp"
 #include "rendervulkan.hpp"
 #include "wlserver.hpp"
 #include "vblankmanager.hpp"
@@ -42,9 +43,6 @@
 
 #include <cinttypes>
 
-#define WL_FRACTIONAL_SCALE_DENOMINATOR 120
-
-
 extern int g_nPreferredOutputWidth;
 extern int g_nPreferredOutputHeight;
 extern bool g_bForceHDR10OutputDebug;
@@ -74,12 +72,9 @@ auto CallWithAllButLast(Func pFunc, Args&&... args)
     return Forwarder(std::forward_as_tuple(args...), std::make_index_sequence<sizeof...(Args) - 1>());
 }
 
-static inline uint32_t WaylandScaleToPhysical( uint32_t pValue, uint32_t pFactor ) {
-    return pValue * pFactor / WL_FRACTIONAL_SCALE_DENOMINATOR;
-}
-static inline uint32_t WaylandScaleToLogical( uint32_t pValue, uint32_t pFactor ) {
-    return div_roundup( pValue * WL_FRACTIONAL_SCALE_DENOMINATOR, pFactor );
-}
+using gamescope::wayland::WaylandScalePositionToLogical;
+using gamescope::wayland::WaylandScaleToLogical;
+using gamescope::wayland::WaylandScaleToPhysical;
 
 [[maybe_unused]] static bool IsGamescopeProxy( void *pProxy ) {
 	// HACK: this probably should never be called with a null pointer, but it
@@ -1838,8 +1833,8 @@ namespace gamescope
             {
                 wl_subsurface_set_position(
                     m_pSubsurface,
-                    WaylandScaleToLogical( oState->nDestX, uScale ),
-                    WaylandScaleToLogical( oState->nDestY, uScale ) );
+                    WaylandScalePositionToLogical( oState->nDestX, uScale ),
+                    WaylandScalePositionToLogical( oState->nDestY, uScale ) );
             }
             // The x/y here does nothing? Why? What is it for...
             // Use the subsurface set_position thing instead.
@@ -2179,6 +2174,10 @@ namespace gamescope
 
     void CWaylandPlane::Wayland_FractionalScale_PreferredScale( wp_fractional_scale_v1 *pFractionalScale, uint32_t uScale )
     {
+        // Every use of the scale divides by it.
+        if ( !uScale )
+            return;
+
         bool bDirty = false;
 
         static uint32_t s_uGlobalFractionalScale = 120;
