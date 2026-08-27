@@ -10,6 +10,7 @@
 #include "refresh_rate.h"
 #include "waitable.h"
 #include "Utils/TempFiles.h"
+#include "window_icon.hpp"
 
 #include <cstring>
 #include <unordered_map>
@@ -1297,22 +1298,17 @@ namespace gamescope
         if ( !m_pBackend->GetToplevelIconManager() )
             return;
 
-        if ( uIconPixels && uIconPixels->size() >= 3 )
+        std::optional<window_icon::WindowIcon> oIcon;
+        if ( uIconPixels )
+            oIcon = window_icon::ParseWindowIcon( *uIconPixels, true );
+
+        if ( oIcon )
         {
-            xdg_toplevel_icon_v1 *pIcon = xdg_toplevel_icon_manager_v1_create_icon( m_pBackend->GetToplevelIconManager() );
-            if ( !pIcon )
-            {
-                xdg_log.errorf( "Failed to create xdg_toplevel_icon_v1" );
-                return;
-            }
-            defer( xdg_toplevel_icon_v1_destroy( pIcon ) );
+            const size_t uPixelOffset = size_t( oIcon->pixels.data() - uIconPixels->data() );
 
-            const uint32_t uWidth  = ( *uIconPixels )[0];
-            const uint32_t uHeight = ( *uIconPixels )[1];
-
-            const uint32_t uStride = uWidth * 4;
-            const uint32_t uSize   = uStride * uHeight;
-            int32_t nFd = CreateShmBuffer( uSize, &( *uIconPixels )[2] );
+            const size_t uStride = size_t( oIcon->uWidth ) * 4;
+            const size_t uSize   = uStride * size_t( oIcon->uHeight );
+            int32_t nFd = CreateShmBuffer( uint32_t( uSize ), uIconPixels->data() + uPixelOffset );
             if ( nFd < 0 )
             {
                 xdg_log.errorf( "Failed to create/map shm buffer" );
@@ -1320,11 +1316,19 @@ namespace gamescope
             }
             defer( close( nFd ) );
 
-            wl_shm_pool *pPool = wl_shm_create_pool( m_pBackend->GetShm(), nFd, uSize );
+            wl_shm_pool *pPool = wl_shm_create_pool( m_pBackend->GetShm(), nFd, int32_t( uSize ) );
             defer( wl_shm_pool_destroy( pPool ) );
 
-            wl_buffer *pBuffer = wl_shm_pool_create_buffer( pPool, 0, uWidth, uHeight, uStride, WL_SHM_FORMAT_ARGB8888 );
+            wl_buffer *pBuffer = wl_shm_pool_create_buffer( pPool, 0, int32_t( oIcon->uWidth ), int32_t( oIcon->uHeight ), int32_t( uStride ), WL_SHM_FORMAT_ARGB8888 );
             defer( wl_buffer_destroy( pBuffer ) );
+
+            xdg_toplevel_icon_v1 *pIcon = xdg_toplevel_icon_manager_v1_create_icon( m_pBackend->GetToplevelIconManager() );
+            if ( !pIcon )
+            {
+                xdg_log.errorf( "Failed to create xdg_toplevel_icon_v1" );
+                return;
+            }
+            defer( xdg_toplevel_icon_v1_destroy( pIcon ) );
 
             xdg_toplevel_icon_v1_add_buffer( pIcon, pBuffer, 1 );
 
