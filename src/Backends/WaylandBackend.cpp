@@ -305,6 +305,9 @@ namespace gamescope
         float m_flPreviousSaturationScale = 1.0f;
         wp_image_description_v1 *m_pCurrentImageDescription = nullptr;
 
+        static constexpr size_t k_uMaxPendingFeedbacks = 64;
+        std::vector<struct wp_presentation_feedback *> m_PendingFeedbacks;
+
         std::mutex m_PlaneStateLock;
         std::optional<WaylandPlaneState> m_oCurrentPlaneState;
     };
@@ -1356,6 +1359,12 @@ namespace gamescope
 
         m_oCurrentPlaneState = std::nullopt;
 
+        // Destroying the proxy also drops any event libwayland has queued for
+        // it, so no callback can reach this plane after here.
+        for ( struct wp_presentation_feedback *pFeedback : m_PendingFeedbacks )
+            wp_presentation_feedback_destroy( pFeedback );
+        m_PendingFeedbacks.clear();
+
         if ( m_pFrame )
             libdecor_frame_unref( m_pFrame ); // Ew.
 
@@ -1462,6 +1471,20 @@ namespace gamescope
             {
                 struct wp_presentation_feedback *pFeedback = wp_presentation_feedback( m_pBackend->GetPresentation(), m_pSurface );
                 wp_presentation_feedback_add_listener( pFeedback, &s_PresentationFeedbackListener, this );
+                m_PendingFeedbacks.push_back( pFeedback );
+
+                if ( m_PendingFeedbacks.size() > k_uMaxPendingFeedbacks )
+                {
+                    static bool s_bWarnedPendingFeedbacks = false;
+                    if ( !s_bWarnedPendingFeedbacks )
+                    {
+                        s_bWarnedPendingFeedbacks = true;
+                        xdg_log.errorf( "More than %zu presentation feedbacks are outstanding. Dropping the oldest.", k_uMaxPendingFeedbacks );
+                    }
+
+                    wp_presentation_feedback_destroy( m_PendingFeedbacks.front() );
+                    m_PendingFeedbacks.erase( m_PendingFeedbacks.begin() );
+                }
             }
 
             if ( m_pWPColorManagedSurface )
@@ -1783,6 +1806,7 @@ namespace gamescope
         }
 
         GetVBlankTimer().MarkVBlank( ulTime, true );
+        std::erase( m_PendingFeedbacks, pFeedback );
         wp_presentation_feedback_destroy( pFeedback );
 
         // Nudge so that steamcompmgr releases commits.
@@ -1790,6 +1814,7 @@ namespace gamescope
     }
     void CWaylandPlane::Wayland_PresentationFeedback_Discarded( struct wp_presentation_feedback *pFeedback )
     {
+        std::erase( m_PendingFeedbacks, pFeedback );
         wp_presentation_feedback_destroy( pFeedback );
 
         // Nudge so that steamcompmgr releases commits.
