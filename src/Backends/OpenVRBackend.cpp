@@ -16,6 +16,7 @@
 #include "wlserver.hpp"
 #include "log.hpp"
 #include "ime.hpp"
+#include "window_icon.hpp"
 #include "refresh_rate.h"
 #include "edid.h"
 #include "Ratio.h"
@@ -1915,24 +1916,30 @@ namespace gamescope
     {
         bool bExplicitNonSteam = VirtualConnectorKeyIsNonSteamWindow( GetVirtualConnectorKey() );
 
-        if ( cv_vr_use_window_icons && uIconPixels && uIconPixels->size() >= 3 )
-        {
-            const uint32_t uWidth = (*uIconPixels)[0];
-            const uint32_t uHeight = (*uIconPixels)[1];
+        std::optional<window_icon::WindowIcon> oIcon;
+        if ( cv_vr_use_window_icons && uIconPixels )
+            oIcon = window_icon::ParseWindowIcon( *uIconPixels );
 
+        if ( oIcon )
+        {
             struct rgba_t
             {
                 uint8_t r,g,b,a;
             };
 
-            for ( uint32_t& val : *uIconPixels )
+            // Into a copy: the icon vector outlives this call and is uploaded
+            // again on every focus change, so swapping it in place would put
+            // the channels back the second time.
+            std::vector<uint32_t> swizzled( oIcon->pixels.begin(), oIcon->pixels.end() );
+
+            for ( uint32_t &val : swizzled )
             {
                 rgba_t rgb = *((rgba_t*)&val);
                 std::swap(rgb.r, rgb.b);
                 val = *((uint32_t*)&rgb);
             }
 
-            vr::VROverlay()->SetOverlayRaw( GetPrimaryPlane()->GetOverlayThumbnail(), &(*uIconPixels)[2], uWidth, uHeight, sizeof(uint32_t) );
+            vr::VROverlay()->SetOverlayRaw( GetPrimaryPlane()->GetOverlayThumbnail(), swizzled.data(), oIcon->uWidth, oIcon->uHeight, sizeof(uint32_t) );
         }
         else if ( m_pBackend->GetOverlayIcon() && !bExplicitNonSteam )
         {
