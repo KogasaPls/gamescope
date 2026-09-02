@@ -57,6 +57,7 @@
 #include "presentation-time-protocol.h"
 
 #include "wlserver.hpp"
+#include "wlserver_cursor_helpers.hpp"
 #include "hdmi.h"
 #include "main.hpp"
 #include "steamcompmgr.hpp"
@@ -2256,6 +2257,7 @@ bool wlserver_init( void ) {
 	}
 
 	wlserver.wlr.seat = wlr_seat_create(wlserver.display, "seat0");
+	pixman_region32_init( &wlserver.confine );
 	wlr_seat_set_capabilities( wlserver.wlr.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_TOUCH );
 
 	wl_log.infof("Running compositor on wayland display '%s'", wlserver.wl_display_name);
@@ -2442,6 +2444,7 @@ void wlserver_run(void)
 
 	wl_display_destroy_clients(wlserver.display);
 	wl_display_destroy(wlserver.display);
+	pixman_region32_fini( &wlserver.confine );
     wlserver.display = NULL;
 	wlserver_unlock(false);
 }
@@ -2881,35 +2884,15 @@ static void wlserver_update_cursor_constraint()
 
 		if (!pixman_region32_contains_point(pRegion, floor(wlserver.mouse_surface_cursorx), floor(wlserver.mouse_surface_cursory), NULL))
 		{
-			int nboxes;
-			pixman_box32_t *boxes = pixman_region32_rectangles(pRegion, &nboxes);
-			if ( nboxes )
+			if ( gamescope::wlserver_cursor::clamp_point_into_region( pRegion,
+					&wlserver.mouse_surface_cursorx, &wlserver.mouse_surface_cursory ) )
 			{
-				double flBestDistSqr = DBL_MAX;
-				int nBestBox = 0;
-				for ( int i = 0; i < nboxes; i++ )
-				{
-					double cx = std::clamp<double>( wlserver.mouse_surface_cursorx, boxes[i].x1, boxes[i].x2 );
-					double cy = std::clamp<double>( wlserver.mouse_surface_cursory, boxes[i].y1, boxes[i].y2 );
-					double dx = cx - wlserver.mouse_surface_cursorx;
-					double dy = cy - wlserver.mouse_surface_cursory;
-					double flDistSqr = dx * dx + dy * dy;
-					if ( flDistSqr < flBestDistSqr )
-					{
-						flBestDistSqr = flDistSqr;
-						nBestBox = i;
-					}
-				}
-
-				wlserver.mouse_surface_cursorx = std::clamp<double>( wlserver.mouse_surface_cursorx, boxes[nBestBox].x1, boxes[nBestBox].x2);
-				wlserver.mouse_surface_cursory = std::clamp<double>( wlserver.mouse_surface_cursory, boxes[nBestBox].y1, boxes[nBestBox].y2);
-
 				wlr_seat_pointer_warp( wlserver.wlr.seat, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
 			}
 		}
 	}
 
-	if (pConstraint->type == WLR_POINTER_CONSTRAINT_V1_CONFINED)
+	if ( pConstraint->type == WLR_POINTER_CONSTRAINT_V1_CONFINED && gamescope::wlserver_cursor::region_has_area( pRegion ) )
 		pixman_region32_copy(&wlserver.confine, pRegion);
 	else
 		pixman_region32_clear(&wlserver.confine);
@@ -3002,25 +2985,13 @@ static bool wlserver_apply_constraint( double *dx, double *dy )
 
 	if ( pConstraint )
 	{
-		if ( pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED )
-			return false;
-
-		// wlroots >= 0.19 leaves constraint->region empty until the first commit after a regionless confine
-		if ( pixman_region32_empty( &wlserver.confine ) )
-			return true;
-
-		double sx = wlserver.mouse_surface_cursorx;
-		double sy = wlserver.mouse_surface_cursory;
-
-		double sx_confined, sy_confined;
-		if ( !wlr_region_confine( &wlserver.confine, sx, sy, sx + *dx, sy + *dy, &sx_confined, &sy_confined ) )
-			return false;
-
-		*dx = sx_confined - sx;
-		*dy = sy_confined - sy;
-
-		if ( *dx == 0.0 && *dy == 0.0 )
-			return false;
+		return gamescope::wlserver_cursor::apply_confine_constraint(
+			pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED,
+			&wlserver.confine,
+			wlserver.mouse_surface_cursorx,
+			wlserver.mouse_surface_cursory,
+			dx,
+			dy );
 	}
 
 	return true;
