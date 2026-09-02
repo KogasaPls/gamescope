@@ -1969,7 +1969,8 @@ namespace gamescope
 
     void CWaylandPlane::Present( const FrameInfo_t::Layer_t *pLayer, const app_viewport::Rect &viewport )
     {
-        CWaylandFb *pWaylandFb = pLayer && pLayer->tex != nullptr ? static_cast<CWaylandFb*>( pLayer->tex->GetBackendFb()->EnsureImported() ) : nullptr;
+        IBackendFb *pBackendFb = pLayer && pLayer->tex != nullptr ? pLayer->tex->GetBackendFb() : nullptr;
+        CWaylandFb *pWaylandFb = pBackendFb ? static_cast<CWaylandFb*>( pBackendFb->EnsureImported() ) : nullptr;
 
         // Decide before acquiring: an acquired wl_buffer that never reaches
         // wl_surface_attach is never released.
