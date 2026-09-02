@@ -1109,6 +1109,9 @@ namespace gamescope
             bNeedsFullComposite |= pFrameInfo->bFadingOut;
             bNeedsFullComposite |= !g_reshade_effect.empty();
 
+            for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
+                bNeedsFullComposite |= pFrameInfo->layers.get( i ).tex != nullptr && !pFrameInfo->layers.get( i ).tex->GetBackendFb();
+
             if ( g_bOutputHDREnabled )
                 bNeedsFullComposite |= g_bHDRItmEnable;
 
@@ -1692,7 +1695,8 @@ namespace gamescope
 
     void CWaylandPlane::Present( const FrameInfo_t::Layer_t *pLayer )
     {
-        CWaylandFb *pWaylandFb = pLayer && pLayer->tex != nullptr ? static_cast<CWaylandFb*>( pLayer->tex->GetBackendFb()->EnsureImported() ) : nullptr;
+        IBackendFb *pBackendFb = pLayer && pLayer->tex != nullptr ? pLayer->tex->GetBackendFb() : nullptr;
+        CWaylandFb *pWaylandFb = pBackendFb ? static_cast<CWaylandFb*>( pBackendFb->EnsureImported() ) : nullptr;
         wl_buffer *pBuffer = pWaylandFb ? pWaylandFb->GetHostBuffer() : nullptr;
 
         if ( pBuffer )
