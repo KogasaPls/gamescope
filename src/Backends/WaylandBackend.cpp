@@ -332,8 +332,6 @@ namespace gamescope
         libdecor_window_state m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
         std::vector<wl_output *> m_pOutputs;
         bool m_bNeedsDecorCommit = false;
-        bool m_bUnmappedAwaitingConfigure = false;
-        bool m_bHasAttachedBuffer = false;
         uint32_t m_uFractionalScale = 120;
         bool m_bHasRecievedScale = false;
 
@@ -1145,10 +1143,7 @@ namespace gamescope
 
     void CWaylandConnector::UpdateFullscreenState()
     {
-        if ( !m_bVisible )
-            g_bFullscreen = false;
-
-        if ( m_bDesiredFullscreenState != g_bFullscreen && m_bVisible )
+        if ( m_bDesiredFullscreenState != g_bFullscreen )
         {
             if ( m_bDesiredFullscreenState )
                 libdecor_frame_set_fullscreen( m_Planes[0].GetFrame(), nullptr );
@@ -1714,6 +1709,26 @@ namespace gamescope
 
     void CWaylandPlane::Present( std::optional<WaylandPlaneState> oState )
     {
+        // Unmapping the toplevel makes the host drop the window, and a tiling
+        // host reflows its layout around the gap, so it shows black instead.
+        if ( !oState && m_pFrame )
+        {
+            const app_viewport::Rect viewport = m_pConnector->GetViewport();
+            oState = WaylandPlaneState
+            {
+                .pBuffer     = m_pBackend->GetBlackFb()->GetHostBuffer(),
+                .nOutputX    = viewport.nX,
+                .nOutputY    = viewport.nY,
+                .flSrcWidth  = 1.0,
+                .flSrcHeight = 1.0,
+                .nDstWidth   = int32_t( viewport.uWidth ),
+                .nDstHeight  = int32_t( viewport.uHeight ),
+                .eColorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU,
+                .bOpaque     = true,
+                .uFractionalScale = GetScale(),
+            };
+        }
+
         {
             std::unique_lock lock( m_PlaneStateLock );
             m_oCurrentPlaneState = oState;
@@ -1947,11 +1962,6 @@ namespace gamescope
             }
             // The x/y here does nothing? Why? What is it for...
             // Use the subsurface set_position thing instead.
-            if ( m_pFrame && m_bUnmappedAwaitingConfigure )
-                return;
-
-            m_bHasAttachedBuffer = true;
-
             wl_surface_attach( m_pSurface, oState->pBuffer, 0, 0 );
             wl_surface_damage( m_pSurface, 0, 0, INT32_MAX, INT32_MAX );
             wl_surface_set_opaque_region( m_pSurface, oState->bOpaque ? m_pBackend->GetFullRegion() : nullptr );
@@ -1959,12 +1969,6 @@ namespace gamescope
         }
         else
         {
-            // Attaching NULL only unmaps (and so requires a new configure) if a buffer was mapped.
-            if ( m_pFrame && m_bHasAttachedBuffer )
-                m_bUnmappedAwaitingConfigure = true;
-
-            m_bHasAttachedBuffer = false;
-
             wl_surface_attach( m_pSurface, nullptr, 0, 0 );
             wl_surface_damage( m_pSurface, 0, 0, INT32_MAX, INT32_MAX );
         }
@@ -2112,8 +2116,6 @@ namespace gamescope
             g_nOutputWidth  = oOutput->uWidth;
             g_nOutputHeight = oOutput->uHeight;
         }
-
-        m_bUnmappedAwaitingConfigure = false;
 
         CommitLibDecor( pConfiguration );
 
