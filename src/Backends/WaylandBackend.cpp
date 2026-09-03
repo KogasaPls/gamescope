@@ -39,6 +39,7 @@
 #include <primary-selection-unstable-v1-client-protocol.h>
 #include <fractional-scale-v1-client-protocol.h>
 #include <tearing-control-v1-client-protocol.h>
+#include <content-type-v1-client-protocol.h>
 #include <xdg-toplevel-icon-v1-client-protocol.h>
 #include "wlr_end.hpp"
 
@@ -339,6 +340,7 @@ namespace gamescope
         wp_color_management_surface_feedback_v1 *m_pWPColorManagedSurfaceFeedback = nullptr;
         wp_fractional_scale_v1 *m_pFractionalScale = nullptr;
         wp_tearing_control_v1 *m_pTearingControl = nullptr;
+        wp_content_type_v1 *m_pContentType = nullptr;
         wl_subsurface *m_pSubsurface = nullptr;
         libdecor_frame *m_pFrame = nullptr;
         libdecor_window_state m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
@@ -805,6 +807,7 @@ namespace gamescope
             { return Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, eFeature ); }
         wp_fractional_scale_manager_v1 *GetFractionalScaleManager() const { return m_pFractionalScaleManager; }
         wp_tearing_control_manager_v1 *GetTearingControlManager() const { return m_pTearingControlManager; }
+        wp_content_type_manager_v1 *GetContentTypeManager() const { return m_pContentTypeManager; }
         xdg_toplevel_icon_manager_v1 *GetToplevelIconManager() const { return m_pToplevelIconManager; }
         libdecor *GetLibDecor() const { return m_pLibDecor; }
 
@@ -911,6 +914,7 @@ namespace gamescope
         zwp_relative_pointer_manager_v1 *m_pRelativePointerManager = nullptr;
         wp_fractional_scale_manager_v1 *m_pFractionalScaleManager = nullptr;
         wp_tearing_control_manager_v1 *m_pTearingControlManager = nullptr;
+        wp_content_type_manager_v1 *m_pContentTypeManager = nullptr;
         xdg_toplevel_icon_manager_v1 *m_pToplevelIconManager = nullptr;
 
         // TODO: Restructure and remove the need for this.
@@ -1637,6 +1641,8 @@ namespace gamescope
             wl_subsurface_destroy( m_pSubsurface );
         if ( m_pTearingControl )
             wp_tearing_control_v1_destroy( m_pTearingControl );
+        if ( m_pContentType )
+            wp_content_type_v1_destroy( m_pContentType );
         if ( m_pFractionalScale )
             wp_fractional_scale_v1_destroy( m_pFractionalScale );
         if ( m_pWPColorManagedSurface )
@@ -1690,6 +1696,12 @@ namespace gamescope
 
         if ( !pParent && m_pBackend->GetTearingControlManager() )
             m_pTearingControl = wp_tearing_control_manager_v1_get_tearing_control( m_pBackend->GetTearingControlManager(), m_pSurface );
+
+        if ( !pParent && m_pBackend->GetContentTypeManager() )
+        {
+            m_pContentType = wp_content_type_manager_v1_get_surface_content_type( m_pBackend->GetContentTypeManager(), m_pSurface );
+            wp_content_type_v1_set_content_type( m_pContentType, WP_CONTENT_TYPE_V1_TYPE_GAME );
+        }
 
         if ( !pParent )
         {
@@ -2936,6 +2948,10 @@ namespace gamescope
         else if ( !strcmp( pInterface, wp_tearing_control_manager_v1_interface.name ) )
         {
             m_pTearingControlManager = (wp_tearing_control_manager_v1 *)wl_registry_bind( pRegistry, uName, &wp_tearing_control_manager_v1_interface, 1u );
+        }
+        else if ( !strcmp( pInterface, wp_content_type_manager_v1_interface.name ) )
+        {
+            m_pContentTypeManager = (wp_content_type_manager_v1 *)wl_registry_bind( pRegistry, uName, &wp_content_type_manager_v1_interface, 1u );
         }
         else if ( !strcmp( pInterface, wl_shm_interface.name ) )
         {
