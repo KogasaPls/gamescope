@@ -24,6 +24,7 @@ protocols = [
 	wl_protocol_dir / 'staging/fractional-scale/fractional-scale-v1.xml',
 	wl_protocol_dir / 'staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
 	wl_protocol_dir / 'staging/tearing-control/tearing-control-v1.xml',
+	wl_protocol_dir / 'staging/content-type/content-type-v1.xml',
 
 	'color-management-v1.xml',
 
