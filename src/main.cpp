@@ -1035,8 +1035,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	// Empty, not unset, so libwayland's wayland-0 fallback can't reach the parent compositor.
-	setenv("WAYLAND_DISPLAY", "", 1);
+	// Unset rather than empty: Proton and Chromium test only whether the
+	// variable is present, and an empty value makes them pick a Wayland driver
+	// that cannot connect while disabling their X11 path. Unsetting reopens
+	// libwayland's wayland-0 fallback; accepted here, where the host socket is
+	// wayland-1.
+	unsetenv("WAYLAND_DISPLAY");
 
 	// If DRM format modifiers aren't supported, prevent our clients from using
 	// DCC, as this can cause tiling artifacts.
