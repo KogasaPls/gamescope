@@ -1273,8 +1273,24 @@ namespace gamescope
 
         if ( !m_bVisible )
         {
-            for ( CWaylandPlane &plane : m_Planes )
-                plane.Present( nullptr, frameViewport );
+            m_pBackend->GetBlackFb()->OnCompositorAcquire();
+            m_Planes[0].Present(
+                WaylandPlaneState
+                {
+                    .pBuffer     = m_pBackend->GetBlackFb()->GetHostBuffer(),
+                    .nOutputX    = frameViewport.nX,
+                    .nOutputY    = frameViewport.nY,
+                    .flSrcWidth  = 1.0,
+                    .flSrcHeight = 1.0,
+                    .nDstWidth   = int32_t( frameViewport.uWidth ),
+                    .nDstHeight  = int32_t( frameViewport.uHeight ),
+                    .eColorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU,
+                    .bOpaque     = true,
+                    .uFractionalScale = m_Planes[0].GetScale(),
+                } );
+
+            for ( size_t i = 1; i < std::size( m_Planes ); i++ )
+                m_Planes[i].Present( nullptr, frameViewport );
         }
         else
         {
@@ -1945,7 +1961,9 @@ namespace gamescope
             wl_surface_set_opaque_region( m_pSurface, oState->bOpaque ? m_pBackend->GetFullRegion() : nullptr );
             wl_surface_set_buffer_scale( m_pSurface, 1 );
         }
-        else
+        // Unmapping the toplevel makes the host drop the window, and a tiling
+        // host reflows its layout around the gap.
+        else if ( m_pSubsurface )
         {
             if ( m_pFrame )
                 m_bUnmappedAwaitingConfigure = true;
