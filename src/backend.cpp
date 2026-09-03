@@ -153,6 +153,11 @@ namespace gamescope
     // CBaseBackendConnector
     /////////////////////////
 
+    bool IBackendConnector::SupportsTearing() const
+    {
+        return GetBackend()->SupportsTearing();
+    }
+
     VBlankScheduleTime CBaseBackendConnector::FrameSync()
     {
         VBlankScheduleTime schedule = GetVBlankTimer().CalcNextWakeupTime( false );
