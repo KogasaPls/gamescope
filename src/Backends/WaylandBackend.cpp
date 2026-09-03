@@ -37,6 +37,7 @@
 #include <relative-pointer-unstable-v1-client-protocol.h>
 #include <primary-selection-unstable-v1-client-protocol.h>
 #include <fractional-scale-v1-client-protocol.h>
+#include <tearing-control-v1-client-protocol.h>
 #include <xdg-toplevel-icon-v1-client-protocol.h>
 #include "wlr_end.hpp"
 
@@ -269,6 +270,16 @@ namespace gamescope
 
         void UpdateVRRRefreshRate();
 
+        void SetTearingHint( bool bAsync )
+        {
+            if ( !m_pTearingControl || bAsync == m_bTearingHintAsync )
+                return;
+
+            wp_tearing_control_v1_set_presentation_hint( m_pTearingControl,
+                bAsync ? WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC : WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC );
+            m_bTearingHintAsync = bAsync;
+        }
+
     private:
 
         void Wayland_Surface_Enter( wl_surface *pSurface, wl_output *pOutput );
@@ -332,6 +343,7 @@ namespace gamescope
         wp_color_management_surface_v1 *m_pWPColorManagedSurface = nullptr;
         wp_color_management_surface_feedback_v1 *m_pWPColorManagedSurfaceFeedback = nullptr;
         wp_fractional_scale_v1 *m_pFractionalScale = nullptr;
+        wp_tearing_control_v1 *m_pTearingControl = nullptr;
         wl_subsurface *m_pSubsurface = nullptr;
         libdecor_frame *m_pFrame = nullptr;
         libdecor_window_state m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
@@ -339,6 +351,7 @@ namespace gamescope
         bool m_bNeedsDecorCommit = false;
         uint32_t m_uFractionalScale = 120;
         bool m_bHasRecievedScale = false;
+        bool m_bTearingHintAsync = false;
 
         std::optional<WaylandPlaneColorState> m_ColorState{};
         float m_flPreviousSaturationScale = 1.0f;
@@ -448,6 +461,7 @@ namespace gamescope
         bool Init();
         void SetFullscreen( bool bFullscreen ); // Thread safe, can be called from the input thread.
         void UpdateFullscreenState();
+        bool IsFullscreen() const { return !!( m_Planes[0].GetWindowState() & LIBDECOR_WINDOW_STATE_FULLSCREEN ); }
 
         // libdecor's first configure arrives during init, before any Present
         // has run UpdateViewport, so m_Viewport is still the zero rect there.
@@ -798,6 +812,7 @@ namespace gamescope
         bool SupportsWPFeature( wp_color_manager_v1_feature eFeature ) const
             { return Algorithm::Contains( m_WPColorManagerFeatures.eFeatures, eFeature ); }
         wp_fractional_scale_manager_v1 *GetFractionalScaleManager() const { return m_pFractionalScaleManager; }
+        wp_tearing_control_manager_v1 *GetTearingControlManager() const { return m_pTearingControlManager; }
         xdg_toplevel_icon_manager_v1 *GetToplevelIconManager() const { return m_pToplevelIconManager; }
         libdecor *GetLibDecor() const { return m_pLibDecor; }
 
@@ -903,6 +918,7 @@ namespace gamescope
         zwp_pointer_constraints_v1 *m_pPointerConstraints = nullptr;
         zwp_relative_pointer_manager_v1 *m_pRelativePointerManager = nullptr;
         wp_fractional_scale_manager_v1 *m_pFractionalScaleManager = nullptr;
+        wp_tearing_control_manager_v1 *m_pTearingControlManager = nullptr;
         xdg_toplevel_icon_manager_v1 *m_pToplevelIconManager = nullptr;
 
         // TODO: Restructure and remove the need for this.
@@ -1270,6 +1286,7 @@ namespace gamescope
         // again on the next visible frame.
         if ( m_bVisible )
             UpdateViewport( pFrameInfo );
+        m_Planes[0].SetTearingHint( bAsync );
         const app_viewport::Rect frameViewport = GetViewport();
 
         bool bNeedsFullComposite = false;
@@ -1617,6 +1634,8 @@ namespace gamescope
 
         if ( m_pSubsurface )
             wl_subsurface_destroy( m_pSubsurface );
+        if ( m_pTearingControl )
+            wp_tearing_control_v1_destroy( m_pTearingControl );
         if ( m_pFractionalScale )
             wp_fractional_scale_v1_destroy( m_pFractionalScale );
         if ( m_pWPColorManagedSurface )
@@ -1667,6 +1686,9 @@ namespace gamescope
             if ( !pParent )
                 wp_fractional_scale_v1_add_listener( m_pFractionalScale, &s_FractionalScaleListener, this );
         }
+
+        if ( !pParent && m_pBackend->GetTearingControlManager() )
+            m_pTearingControl = wp_tearing_control_manager_v1_get_tearing_control( m_pBackend->GetTearingControlManager(), m_pSurface );
 
         if ( !pParent )
         {
@@ -2626,9 +2648,15 @@ namespace gamescope
         return false;
     }
 
+    // A host may advertise tearing control and still refuse to tear: sway only
+    // does it for a fullscreen view on an output with allow_tearing yes. The
+    // protocol has no feedback event, so answer for the case that can work,
+    // since a true answer also makes steamcompmgr paint on repaint rather than
+    // on vblank.
     bool CWaylandBackend::SupportsTearing() const
     {
-        return false;
+        CWaylandConnector *pFocusConnector = m_pFocusConnector;
+        return m_pTearingControlManager != nullptr && pFocusConnector && pFocusConnector->IsFullscreen();
     }
     bool CWaylandBackend::UsesVulkanSwapchain() const
     {
@@ -2912,6 +2940,10 @@ namespace gamescope
         else if ( !strcmp( pInterface, wp_fractional_scale_manager_v1_interface.name ) )
         {
             m_pFractionalScaleManager = (wp_fractional_scale_manager_v1 *)wl_registry_bind( pRegistry, uName, &wp_fractional_scale_manager_v1_interface, 1u );
+        }
+        else if ( !strcmp( pInterface, wp_tearing_control_manager_v1_interface.name ) )
+        {
+            m_pTearingControlManager = (wp_tearing_control_manager_v1 *)wl_registry_bind( pRegistry, uName, &wp_tearing_control_manager_v1_interface, 1u );
         }
         else if ( !strcmp( pInterface, wl_shm_interface.name ) )
         {
