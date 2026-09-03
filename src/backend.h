@@ -188,6 +188,7 @@ namespace gamescope
         virtual bool IsVRRActive() const = 0;
         virtual std::span<const BackendMode> GetModes() const = 0;
 
+        virtual bool SupportsTearing() const;
         virtual bool SupportsVRR() const = 0;
 
         virtual std::span<const uint8_t> GetRawEDID() const = 0;
