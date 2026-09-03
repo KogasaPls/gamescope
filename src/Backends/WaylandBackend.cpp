@@ -1158,10 +1158,7 @@ namespace gamescope
 
     void CWaylandConnector::UpdateFullscreenState()
     {
-        if ( !m_bVisible )
-            g_bFullscreen = false;
-
-        if ( m_bDesiredFullscreenState != g_bFullscreen && m_bVisible )
+        if ( m_bDesiredFullscreenState != g_bFullscreen )
         {
             if ( m_bDesiredFullscreenState )
                 libdecor_frame_set_fullscreen( m_Planes[0].GetFrame(), nullptr );
@@ -1718,6 +1715,26 @@ namespace gamescope
 
     void CWaylandPlane::Present( std::optional<WaylandPlaneState> oState )
     {
+        // Unmapping the toplevel makes the host drop the window, and a tiling
+        // host reflows its layout around the gap, so it shows black instead.
+        if ( !oState && m_pFrame )
+        {
+            const app_viewport::Rect viewport = m_pConnector->GetViewport();
+            oState = WaylandPlaneState
+            {
+                .pBuffer     = m_pBackend->GetBlackFb()->GetHostBuffer(),
+                .nOutputX    = viewport.nX,
+                .nOutputY    = viewport.nY,
+                .flSrcWidth  = 1.0,
+                .flSrcHeight = 1.0,
+                .nDstWidth   = int32_t( viewport.uWidth ),
+                .nDstHeight  = int32_t( viewport.uHeight ),
+                .eColorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU,
+                .bOpaque     = true,
+                .uFractionalScale = GetScale(),
+            };
+        }
+
         {
             std::unique_lock lock( m_PlaneStateLock );
             m_oCurrentPlaneState = oState;
