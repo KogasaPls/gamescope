@@ -1271,9 +1271,24 @@ namespace gamescope
 
         if ( !m_bVisible )
         {
-            uint32_t uCurrentPlane = 0;
-            for ( int i = 0; i < 8 && uCurrentPlane < 8; i++ )
-                m_Planes[uCurrentPlane++].Present( nullptr, frameViewport );
+            m_pBackend->GetBlackFb()->OnCompositorAcquire();
+            m_Planes[0].Present(
+                WaylandPlaneState
+                {
+                    .pBuffer     = m_pBackend->GetBlackFb()->GetHostBuffer(),
+                    .nOutputX    = frameViewport.nX,
+                    .nOutputY    = frameViewport.nY,
+                    .flSrcWidth  = 1.0,
+                    .flSrcHeight = 1.0,
+                    .nDstWidth   = int32_t( frameViewport.uWidth ),
+                    .nDstHeight  = int32_t( frameViewport.uHeight ),
+                    .eColorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU,
+                    .bOpaque     = true,
+                    .uFractionalScale = m_Planes[0].GetScale(),
+                } );
+
+            for ( int i = 1; i < 8; i++ )
+                m_Planes[i].Present( nullptr, frameViewport );
         }
         else
         {
@@ -1938,7 +1953,10 @@ namespace gamescope
             wl_surface_set_opaque_region( m_pSurface, oState->bOpaque ? m_pBackend->GetFullRegion() : nullptr );
             wl_surface_set_buffer_scale( m_pSurface, 1 );
         }
-        else
+        // A surface with no buffer is unmapped, and an unmapped xdg_surface
+        // goes back to unconfigured: the next buffer attach is a protocol
+        // error until a fresh configure is acked.
+        else if ( m_pSubsurface )
         {
             wl_surface_attach( m_pSurface, nullptr, 0, 0 );
             wl_surface_damage( m_pSurface, 0, 0, INT32_MAX, INT32_MAX );
