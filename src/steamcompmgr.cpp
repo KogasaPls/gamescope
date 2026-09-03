@@ -1041,18 +1041,15 @@ struct global_focus_t : public focus_t
 	gamescope::VirtualConnectorKey_t ulVirtualFocusKey = 0;
 	std::shared_ptr<gamescope::IBackendConnector> pVirtualConnector;
 
+	gamescope::IBackendConnector *GetConnector() const
+	{
+		return pVirtualConnector ? pVirtualConnector.get() : GetBackend()->GetCurrentConnector();
+	}
+
 	gamescope::INestedHints *GetNestedHints()
 	{
-		gamescope::IBackendConnector *pConnector = this->pVirtualConnector.get();
-		if ( !pConnector )
-			pConnector = GetBackend()->GetCurrentConnector();
-
-		if ( pConnector )
-		{
-			return pConnector->GetNestedHints();
-		}
-
-		return nullptr;
+		auto *pConnector = GetConnector();
+		return pConnector ? pConnector->GetNestedHints() : nullptr;
 	}
 };
 
@@ -8230,10 +8227,14 @@ static uint64_t s_PredictedTearingPresentTime = 0;
 // Vblank spacing of those predictions, zero under VRR.
 static uint64_t s_PredictedRefreshGrid = 0;
 
-static uint64_t predicted_present_time( const commit_t &commit )
+static uint64_t predicted_present_time( steamcompmgr_win_t *w, const commit_t &commit )
 {
-	return commit.async && cv_tearing_enabled && GetBackend()->SupportsTearing()
-		? s_PredictedTearingPresentTime : s_PredictedPresentTime;
+	if ( !commit.async || !cv_tearing_enabled )
+		return s_PredictedPresentTime;
+
+	auto iter = g_VirtualConnectorFocuses.find( w->GetVirtualConnectorKey( gamescope::cv_backend_virtual_connector_strategy ) );
+	auto *pConnector = iter != g_VirtualConnectorFocuses.end() ? iter->second.GetConnector() : nullptr;
+	return pConnector && pConnector->SupportsTearing() ? s_PredictedTearingPresentTime : s_PredictedPresentTime;
 }
 
 static uint64_t window_refresh_cycle( steamcompmgr_win_t *w )
@@ -8244,7 +8245,7 @@ static uint64_t window_refresh_cycle( steamcompmgr_win_t *w )
 
 static bool hold_done_commit( CommitDoneEntry_t &entry, steamcompmgr_win_t *w, const commit_t &commit, uint64_t now )
 {
-	const uint64_t predicted = predicted_present_time( commit );
+	const uint64_t predicted = predicted_present_time( w, commit );
 	const bool first = !entry.earliestLatchTime;
 	if ( first )
 	{
@@ -8295,7 +8296,7 @@ static gamescope::CommitQueue::SelectionResult handle_done_commit( steamcompmgr_
 	(*selected)->earliest_present_time = entry.earliestPresentTime;
 	(*selected)->earliest_latch_time = entry.earliestLatchTime;
 	(*selected)->latch_time = now;
-	(*selected)->predicted_present_time = predicted_present_time( **selected );
+	(*selected)->predicted_present_time = predicted_present_time( w, **selected );
 	if ( entry.route )
 	{
 		entry.route->last_expected_present_time = (*selected)->predicted_present_time;
@@ -11250,7 +11251,8 @@ steamcompmgr_main(int argc, char **argv)
 			// for composition to finish before submitting.
 			// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
 			const bool bSurfaceWantsAsync = (pPaintFocus->HeldCommits[HELD_COMMIT_BASE] != nullptr && pPaintFocus->HeldCommits[HELD_COMMIT_BASE]->async);
-			const bool bTearing = cv_tearing_enabled && GetBackend()->SupportsTearing() && bSurfaceWantsAsync;
+			auto *pPaintConnector = pPaintFocus->GetConnector();
+			const bool bTearing = cv_tearing_enabled && bSurfaceWantsAsync && pPaintConnector && pPaintConnector->SupportsTearing();
 
 			enum class FlipType
 			{
