@@ -1688,6 +1688,10 @@ namespace gamescope
             libdecor_frame_unref( m_pFrame ); // Ew.
         m_pFrame = nullptr;
 
+        if ( m_pCurrentImageDescription )
+            wp_image_description_v1_destroy( m_pCurrentImageDescription );
+        m_pCurrentImageDescription = nullptr;
+
         if ( m_pSubsurface )
             wl_subsurface_destroy( m_pSubsurface );
         m_pSubsurface = nullptr;
