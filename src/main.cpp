@@ -23,6 +23,7 @@
 #include <climits>
 
 #include "main.hpp"
+#include "empty_exit_helpers.hpp"
 #include "steamcompmgr.hpp"
 #include "rendervulkan.hpp"
 #include "wlserver.hpp"
@@ -141,6 +142,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "force-orientation", required_argument, nullptr, 0 },
 	{ "force-windows-fullscreen", no_argument, nullptr, 0 },
 	{ "track-app-size", no_argument, nullptr, 0 },
+	{ "exit-when-empty", optional_argument, nullptr, 0 },
 
 	{ "disable-color-management", no_argument, nullptr, 0 },
 	{ "sdr-gamut-wideness", required_argument, nullptr, 0 },
@@ -208,6 +210,7 @@ const char usage[] =
 	"  --force-orientation            rotate the internal display (left, right, normal, upsidedown)\n"
 	"  --force-windows-fullscreen     force windows inside of gamescope to be the size of the nested display (fullscreen)\n"
 	"  --track-app-size               (nested/wayland) size the gamescope window to the focused app window at 1:1 (implies --max-scale 1; only with the auto scaler); the nested desktop size is unchanged\n"
+	"  --exit-when-empty[=seconds]    (nested/wayland) unmap the gamescope window while no client window is left, and shut down once it has stayed that way for the grace period (30 seconds by default, long enough for a launcher's gaps between windows)\n"
 	"  --cursor-scale-height          if specified, sets a base output height to linearly scale the cursor against.\n"
 	"  --virtual-connector-strategy   Specifies how we should make virtual connectors.\n"
 	"  --hdr-enabled                  enable HDR output (needs Gamescope WSI layer enabled for support from clients)\n"
@@ -309,6 +312,7 @@ std::atomic< bool > g_bOutputHDREnabled = { false };
 bool g_bFullscreen = false;
 bool g_bForceRelativeMouse = false;
 bool g_bTrackAppSize = false;
+uint64_t g_ulExitWhenEmptyNanos = 0;
 
 bool g_bGrabbed = false;
 
@@ -822,6 +826,8 @@ int main(int argc, char **argv)
 					gamescope::cv_touch_click_mode = (gamescope::TouchClickMode) parse_integer( optarg, opt_name );
 				} else if (strcmp(opt_name, "generate-drm-mode") == 0) {
 					g_eGamescopeModeGeneration = parse_gamescope_mode_generation( optarg );
+				} else if (strcmp(opt_name, "exit-when-empty") == 0) {
+					g_ulExitWhenEmptyNanos = gamescope::empty_exit::GraceNanosFromSeconds( optarg ? parse_integer( optarg, opt_name ) : 0 );
 				} else if (strcmp(opt_name, "force-composition-rotation") == 0) {
 					g_bForceCompositionRotation = true;
 				} else if (strcmp(opt_name, "force-orientation") == 0) {
