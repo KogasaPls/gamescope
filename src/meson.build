@@ -198,7 +198,7 @@ gamescope_version = configure_file(
   configuration : gamescope_version_conf
 )
 
-  executable(
+  gamescope_binary = executable(
     'gamescope',
     src, reshade_src, gamescope_version,
     include_directories : [reshade_include, sol2_include],
@@ -213,6 +213,12 @@ gamescope_version = configure_file(
     install: true,
     cpp_args: gamescope_cpp_args,
   )
+
+# The unit-test binary does not link backend translation units. Start the
+# real executable to catch duplicate static console/log registrations.
+if get_option('enable_tests')
+  test('startup', gamescope_binary, args: ['--version'])
+endif
 
 gamescope_core_src = [
   'convar.cpp',
