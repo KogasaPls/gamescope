@@ -1391,6 +1391,8 @@ namespace gamescope
         if ( m_pFrame )
             libdecor_frame_unref( m_pFrame ); // Ew.
 
+        if ( m_pCurrentImageDescription )
+            wp_image_description_v1_destroy( m_pCurrentImageDescription );
         if ( m_pSubsurface )
             wl_subsurface_destroy( m_pSubsurface );
         if ( m_pFractionalScale )
