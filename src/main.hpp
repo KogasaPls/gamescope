@@ -3,6 +3,7 @@
 #include <getopt.h>
 
 #include <atomic>
+#include <cstdint>
 
 extern const char *gamescope_optstring;
 extern const struct option *gamescope_options;
@@ -29,6 +30,8 @@ extern bool g_bFullscreen;
 
 extern bool g_bGrabbed;
 extern bool g_bTrackAppSize;
+// The --exit-when-empty grace period in nanoseconds, 0 when the flag is absent.
+extern uint64_t g_ulExitWhenEmptyNanos;
 
 extern float g_mouseSensitivity;
 extern const char *g_sOutputName;
