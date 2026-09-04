@@ -1,5 +1,30 @@
 catch2_dep = dependency('catch2-with-main', required: true)
 
+# Unit tests for the pure helper headers the local patch stack introduces.
+# Deliberately self-contained: this target links no gamescope sources, only
+# header-only helpers, so it shares nothing with the target below but the
+# catch2 dependency. Each patch adds its test file under tests/patch/ and
+# nothing lists them, so a patch carries no edit to this file; a new file
+# needs a reconfigure to be seen.
+patch_test_list = run_command('sh', '-c', 'cd "$1" && ls patch/test_*.cpp 2>/dev/null || true', 'sh', meson.current_source_dir(), check: true).stdout().strip()
+patch_test_sources = []
+if patch_test_list != ''
+	foreach f : patch_test_list.split('\n')
+		patch_test_sources += files(f)
+	endforeach
+endif
+
+if patch_test_sources.length() > 0
+	gamescope_patch_tests = executable(
+		'gamescope_patch_tests',
+		patch_test_sources,
+		include_directories: [include_directories('../src')],
+		dependencies: [catch2_dep, pixman_dep, wlroots_dep],
+		cpp_args: gamescope_cpp_args,
+	)
+	test('patch-stack', gamescope_patch_tests)
+endif
+
 srcdir = '../src'
 unittest_src = []
 foreach src : gamescope_core_src + ['Script/Script.cpp', 'convar_script.cpp']
