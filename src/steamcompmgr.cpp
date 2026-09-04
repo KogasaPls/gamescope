@@ -80,6 +80,7 @@
 #include <inttypes.h>
 
 #include "main.hpp"
+#include "empty_exit_helpers.hpp"
 #include "wlserver.hpp"
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
@@ -9802,6 +9803,8 @@ steamcompmgr_main(int argc, char **argv)
 		}
 	}
 
+	gamescope::empty_exit::State emptyExit;
+
 	for (;;)
 	{
 		{
@@ -10004,6 +10007,23 @@ steamcompmgr_main(int argc, char **argv)
 					determine_and_apply_focus( pFocus );
 					hasRepaint = true;
 				}
+			}
+		}
+
+		if ( g_ulExitWhenEmptyNanos )
+		{
+			bool bWindowShown = false;
+			for ( const auto &iter : g_VirtualConnectorFocuses )
+				bWindowShown |= iter.second.focusWindow != nullptr;
+
+			const bool bEmptyExpired = gamescope::empty_exit::UpdateEmpty(
+				emptyExit, bWindowShown, get_time_in_nanos(), g_ulExitWhenEmptyNanos );
+
+			if ( bEmptyExpired )
+			{
+				xwm_log.infof( "No client window for %lus, shutting down.",
+					(unsigned long)( g_ulExitWhenEmptyNanos / 1'000'000'000ul ) );
+				ShutdownGamescope();
 			}
 		}
 
