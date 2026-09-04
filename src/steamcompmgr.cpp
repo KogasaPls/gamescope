@@ -10033,15 +10033,22 @@ steamcompmgr_main(int argc, char **argv)
 		// Pick our width/height for this potential frame, regardless of how it might change later
 		// At some point we might even add proper locking so we get real updates atomically instead
 		// of whatever jumble of races the below might cause over a couple of frames
-		if ( currentOutputWidth != g_nOutputWidth ||
+		const bool bHDROutputChanged = currentHDROutput != g_bOutputHDREnabled;
+
+		// The HDR flag only feeds the swapchain format; the output images on
+		// every other backend do not depend on it.
+		const bool bReconfigureOutput =
+			currentOutputWidth != g_nOutputWidth ||
 			 currentOutputHeight != g_nOutputHeight ||
 			 currentOutputRefresh != g_nOutputRefresh ||
 			 currentOutputRotation != g_uOutputRotation ||
-			 currentHDROutput != g_bOutputHDREnabled ||
+			 ( bHDROutputChanged && GetBackend()->UsesVulkanSwapchain() ) ||
 			 currentHDRCapable != bOutputHDRCapable ||
-			 currentHDRForce != g_bForceHDRSupportDebug )
+			 currentHDRForce != g_bForceHDRSupportDebug;
+
+		if ( bReconfigureOutput || bHDROutputChanged )
 		{
-			if ( g_nXWaylandCount > 1 )
+			if ( bReconfigureOutput && g_nXWaylandCount > 1 )
 			{
 				g_nNestedHeight = ( g_nNestedWidth * g_nOutputHeight ) / g_nOutputWidth;
 				wlserver_lock();
@@ -10051,18 +10058,21 @@ steamcompmgr_main(int argc, char **argv)
 			}
 
 			// XXX(JoshA): Remake this. It sucks.
-			if ( GetBackend()->UsesVulkanSwapchain() )
+			if ( bReconfigureOutput && GetBackend()->UsesVulkanSwapchain() )
 			{
 				vulkan_remake_swapchain();
 
 				while ( !acquire_next_image() )
 					vulkan_remake_swapchain();
 			}
-			else
+			else if ( bReconfigureOutput )
 			{
 				vulkan_remake_output_images();
 			}
 
+			// A transfer-function flip alone queues no frame on DRM/Wayland;
+			// without one the last frame stays encoded for the old one.
+			hasRepaint = true;
 
 			{
 				gamescope_xwayland_server_t *server = NULL;
