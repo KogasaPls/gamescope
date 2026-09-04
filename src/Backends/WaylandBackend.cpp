@@ -2997,7 +2997,8 @@ namespace gamescope
         switch ( uKey )
         {
             case KEY_F:
-                static_cast< CWaylandConnector * >( m_pBackend->GetCurrentConnector() )->SetFullscreen( !g_bFullscreen );
+                if ( CWaylandConnector *pConnector = static_cast< CWaylandConnector * >( m_pBackend->GetCurrentConnector() ) )
+                    pConnector->SetFullscreen( !g_bFullscreen );
                 break;
 
             case KEY_N:
