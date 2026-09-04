@@ -247,6 +247,8 @@ namespace gamescope
         CWaylandPlane( CWaylandConnector *pBackend );
         ~CWaylandPlane();
 
+        void Shutdown();
+
         bool Init( CWaylandPlane *pParent, CWaylandPlane *pSiblingBelow );
 
         uint32_t GetScale() const;
@@ -614,7 +616,8 @@ namespace gamescope
         // and connector teardown takes it exclusively, so a handler sees either a
         // live proxy or one libwayland has already nulled.
         std::shared_mutex m_mutCursorSurface;
-        void ForgetSurface( wl_surface *pSurface );
+        // The caller holds LockDispatch().
+        void ForgetSurfaceLocked( wl_surface *pSurface );
 
         std::unique_lock<std::shared_mutex> LockDispatch()
         {
@@ -862,6 +865,7 @@ namespace gamescope
             m_uConnectorCount++;
         }
 
+        // The caller holds LockInputDispatch().
         void OnConnectorDestroyed( CWaylandConnector *pConnector )
         {
             wl_surface *pSurface = pConnector->GetToplevelSurface();
@@ -874,7 +878,7 @@ namespace gamescope
                 SetCaptureExtent( 0, 0 );
 
             if ( pSurface )
-                m_InputThread.ForgetSurface( pSurface );
+                m_InputThread.ForgetSurfaceLocked( pSurface );
 
             if ( pSurface && ( pSurface == m_pRequestedRelativeSurface || pSurface == m_pLockedSurface ) )
             {
@@ -1151,7 +1155,10 @@ namespace gamescope
 
     CWaylandConnector::~CWaylandConnector()
     {
+        std::unique_lock dispatchLock = m_pBackend->LockInputDispatch();
         m_pBackend->OnConnectorDestroyed( this );
+        for ( CWaylandPlane &plane : m_Planes )
+            plane.Shutdown();
     }
 
     bool CWaylandConnector::UpdateEdid()
@@ -1666,12 +1673,16 @@ namespace gamescope
 
     CWaylandPlane::~CWaylandPlane()
     {
+        Shutdown();
+    }
+
+    void CWaylandPlane::Shutdown()
+    {
         std::scoped_lock lock{ m_PlaneStateLock };
 
         m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
         m_pOutputs.clear();
         m_bNeedsDecorCommit = false;
-
         m_oCurrentPlaneState = std::nullopt;
 
         // Destroying the proxy also drops any event libwayland has queued for
@@ -1682,25 +1693,47 @@ namespace gamescope
 
         if ( m_pFrame )
             libdecor_frame_unref( m_pFrame ); // Ew.
+        m_pFrame = nullptr;
+
+        if ( m_pCurrentImageDescription )
+            wp_image_description_v1_destroy( m_pCurrentImageDescription );
+        m_pCurrentImageDescription = nullptr;
 
         if ( m_pSubsurface )
             wl_subsurface_destroy( m_pSubsurface );
+        m_pSubsurface = nullptr;
+
         if ( m_pTearingControl )
             wp_tearing_control_v1_destroy( m_pTearingControl );
+        m_pTearingControl = nullptr;
+
         if ( m_pContentType )
             wp_content_type_v1_destroy( m_pContentType );
+        m_pContentType = nullptr;
+
         if ( m_pFractionalScale )
             wp_fractional_scale_v1_destroy( m_pFractionalScale );
+        m_pFractionalScale = nullptr;
+
         if ( m_pWPColorManagedSurface )
             wp_color_management_surface_v1_destroy( m_pWPColorManagedSurface );
+        m_pWPColorManagedSurface = nullptr;
+
         if ( m_pWPColorManagedSurfaceFeedback )
             wp_color_management_surface_feedback_v1_destroy( m_pWPColorManagedSurfaceFeedback );
+        m_pWPColorManagedSurfaceFeedback = nullptr;
+
         if ( m_pFrogColorManagedSurface )
             frog_color_managed_surface_destroy( m_pFrogColorManagedSurface );
+        m_pFrogColorManagedSurface = nullptr;
+
         if ( m_pViewport )
             wp_viewport_destroy( m_pViewport );
+        m_pViewport = nullptr;
+
         if ( m_pSurface )
             wl_surface_destroy( m_pSurface );
+        m_pSurface = nullptr;
     }
 
     bool CWaylandPlane::Init( CWaylandPlane *pParent, CWaylandPlane *pSiblingBelow )
@@ -3393,10 +3426,8 @@ namespace gamescope
         return std::shared_ptr<T>{ pObjectWrapper, []( T *pThing ){ wl_proxy_wrapper_destroy( (void *)pThing ); } };
     }
 
-    void CWaylandInputThread::ForgetSurface( wl_surface *pSurface )
+    void CWaylandInputThread::ForgetSurfaceLocked( wl_surface *pSurface )
     {
-        std::unique_lock lock = LockDispatch();
-
         wl_surface *pExpected = pSurface;
         m_pCurrentCursorSurface.compare_exchange_strong( pExpected, nullptr );
     }
