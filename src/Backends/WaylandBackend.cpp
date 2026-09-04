@@ -1026,6 +1026,7 @@ namespace gamescope
         , m_Planes{ this, this, this, this, this, this, this, this, this }
     {
         m_HDRInfo.bAlwaysPatchEdid = true;
+        m_HDRInfo.bContentDrivenHDR = true;
     }
 
     CWaylandConnector::~CWaylandConnector()
