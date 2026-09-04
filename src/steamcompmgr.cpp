@@ -4442,7 +4442,7 @@ found:;
 
 static void set_wm_state( xwayland_ctx_t *ctx, Window win, uint32_t state )
 {
-	uint32_t wmState[] = { state, None };
+	long wmState[] = { long( state ), None };
 	XChangeProperty(ctx->dpy, win, ctx->atoms.WMStateAtom, ctx->atoms.WMStateAtom, 32,
 				PropModeReplace, (unsigned char *)wmState,
 				sizeof(wmState) / sizeof(wmState[0]));
