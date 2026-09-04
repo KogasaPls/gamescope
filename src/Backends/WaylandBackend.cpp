@@ -2937,7 +2937,8 @@ namespace gamescope
                 {
                     if ( !bPressed )
                     {
-                        static_cast< CWaylandConnector * >( m_pBackend->GetCurrentConnector() )->SetFullscreen( !g_bFullscreen );
+                        if ( CWaylandConnector *pConnector = static_cast< CWaylandConnector * >( m_pBackend->GetCurrentConnector() ) )
+                            pConnector->SetFullscreen( !g_bFullscreen );
                     }
                     return;
                 }
