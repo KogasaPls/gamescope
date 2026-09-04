@@ -2465,7 +2465,7 @@ void MouseCursor::updateCursorFeedback( bool bForce )
 	if ( m_bCursorVisibleFeedback == bVisible && !bForce )
 		return;
 
-	uint32_t value = bVisible ? 1 : 0;
+	long value = bVisible ? 1 : 0;
 
 	XChangeProperty(m_ctx->dpy, m_ctx->root, m_ctx->atoms.gamescopeCursorVisibleFeedback, XA_CARDINAL, 32, PropModeReplace,
 		(unsigned char *)&value, 1 );
@@ -4577,9 +4577,24 @@ found:;
 	return vecPossibleFocusWindows;
  }
 
+// For a string published as CARDINAL/32, which readers already expect: four
+// bytes to an item, each handed to Xlib as the long it reads per item.
+static std::vector<long> string_to_cardinal32( const char *pszString )
+{
+	const size_t uBytes = strlen( pszString ) + 1;
+	std::vector<long> items( ( uBytes + 3 ) / 4 );
+	for ( size_t i = 0; i < items.size(); i++ )
+	{
+		uint32_t uItem = 0;
+		memcpy( &uItem, pszString + i * 4, std::min<size_t>( 4, uBytes - i * 4 ) );
+		items[ i ] = uItem;
+	}
+	return items;
+}
+
 static void set_wm_state( xwayland_ctx_t *ctx, Window win, uint32_t state )
 {
-	uint32_t wmState[] = { state, None };
+	long wmState[] = { long( state ), None };
 	XChangeProperty(ctx->dpy, win, ctx->atoms.WMStateAtom, ctx->atoms.WMStateAtom, 32,
 				PropModeReplace, (unsigned char *)wmState,
 				sizeof(wmState) / sizeof(wmState[0]));
@@ -5355,7 +5370,7 @@ determine_and_apply_focus( global_focus_t *pFocus )
 						{
 							xwm_log.infof( "Changing touch pointer emulation for display %u to %s\n", ctx->xwayland_server->get_index(), bTouchPointerEmulation ? "true" : "false" );
 
-							uint32_t uValue = bTouchPointerEmulation ? 1 : 0;
+							long uValue = bTouchPointerEmulation ? 1 : 0;
 							XChangeProperty( ctx->dpy, ctx->root, ctx->atoms.steamosTouchPointerEmulation, XA_CARDINAL, 32, PropModeReplace,
 											(unsigned char *)&uValue, 1 );
 							ctx->obTouchPointerEmulation = bTouchPointerEmulation;
@@ -5468,14 +5483,17 @@ determine_and_apply_focus( global_focus_t *pFocus )
 		XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeFocusedWindowAtom, XA_CARDINAL, 32, PropModeReplace,
 						(unsigned char *)&focusedWindow, focusedWindow != 0 ? 1 : 0 );
 
+		std::vector<long> focusedDisplayItems = string_to_cardinal32( focused_display );
 		XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeFocusDisplay, XA_CARDINAL, 32, PropModeReplace,
-						(unsigned char *)focused_display, strlen(focused_display) + 1 );
+						(unsigned char *)focusedDisplayItems.data(), focusedDisplayItems.size() );
 
+		std::vector<long> focusedMouseDisplayItems = string_to_cardinal32( focused_mouse_display );
 		XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeMouseFocusDisplay, XA_CARDINAL, 32, PropModeReplace,
-						(unsigned char *)focused_mouse_display, strlen(focused_mouse_display) + 1 );
+						(unsigned char *)focusedMouseDisplayItems.data(), focusedMouseDisplayItems.size() );
 
+		std::vector<long> focusedKeyboardDisplayItems = string_to_cardinal32( focused_keyboard_display );
 		XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeKeyboardFocusDisplay, XA_CARDINAL, 32, PropModeReplace,
-						(unsigned char *)focused_keyboard_display, strlen(focused_keyboard_display) + 1 );
+						(unsigned char *)focusedKeyboardDisplayItems.data(), focusedKeyboardDisplayItems.size() );
 
 		XFlush( root_ctx->dpy );
 	}
@@ -9209,16 +9227,17 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->allDamage = None;
 	ctx->clipChanged = true;
 
+	long lServerId = serverId;
 	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopeXwaylandServerId, XA_CARDINAL, 32, PropModeReplace,
-		(unsigned char *)&serverId, 1 );
+		(unsigned char *)&lServerId, 1 );
 
-	uint32_t unPid = getpid();
+	long unPid = getpid();
 	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopePid, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&unPid, 1 );
 
-	uint32_t unVROverlayForwardingSupported = GetBackend()->SupportsVROverlayForwarding() ? 3 : 0;
+	long unVROverlayForwardingSupported = GetBackend()->SupportsVROverlayForwarding() ? 3 : 0;
 	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopeVROverlayForwarding, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&unVROverlayForwardingSupported, 1 );
 
-	uint32_t uLimiterFeedback = wlserver_get_frame_limiter_state();
+	long uLimiterFeedback = wlserver_get_frame_limiter_state();
 	XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.gamescopeLimiterFeedback, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&uLimiterFeedback, 1 );
 
 	XGrabServer(ctx->dpy);
@@ -9286,7 +9305,7 @@ void update_vrr_atoms(xwayland_ctx_t *root_ctx, bool force, bool* needs_flush = 
 	bool capable = GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->SupportsVRR();
 	if ( capable != g_bVRRCapable_CachedValue || force )
 	{
-		uint32_t capable_value = capable ? 1 : 0;
+		long capable_value = capable ? 1 : 0;
 		XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeVRRCapable, XA_CARDINAL, 32, PropModeReplace,
 			(unsigned char *)&capable_value, 1 );
 		g_bVRRCapable_CachedValue = capable;
@@ -9297,7 +9316,7 @@ void update_vrr_atoms(xwayland_ctx_t *root_ctx, bool force, bool* needs_flush = 
 	bool HDR = GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->SupportsHDR();
 	if ( HDR != g_bSupportsHDR_CachedValue || force )
 	{
-		uint32_t hdr_value = HDR ? 1 : 0;
+		long hdr_value = HDR ? 1 : 0;
 		XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeDisplaySupportsHDR, XA_CARDINAL, 32, PropModeReplace,
 			(unsigned char *)&hdr_value, 1 );
 		g_bSupportsHDR_CachedValue = HDR;
@@ -9308,7 +9327,7 @@ void update_vrr_atoms(xwayland_ctx_t *root_ctx, bool force, bool* needs_flush = 
 	bool in_use = GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive();
 	if ( in_use != g_bVRRInUse_CachedValue || force )
 	{
-		uint32_t in_use_value = in_use ? 1 : 0;
+		long in_use_value = in_use ? 1 : 0;
 		XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeVRRInUse, XA_CARDINAL, 32, PropModeReplace,
 			(unsigned char *)&in_use_value, 1 );
 		g_bVRRInUse_CachedValue = in_use;
@@ -9318,7 +9337,7 @@ void update_vrr_atoms(xwayland_ctx_t *root_ctx, bool force, bool* needs_flush = 
 
 	if ( g_nOutputRefresh != g_nCurrentRefreshRate_CachedValue || force )
 	{
-		int32_t nRefresh = gamescope::ConvertmHzToHz( g_nOutputRefresh );
+		long nRefresh = gamescope::ConvertmHzToHz( g_nOutputRefresh );
 		XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeDisplayRefreshRateFeedback, XA_CARDINAL, 32, PropModeReplace,
 			(unsigned char *)&nRefresh, 1 );
 		g_nCurrentRefreshRate_CachedValue = g_nOutputRefresh;
@@ -9331,7 +9350,7 @@ void update_vrr_atoms(xwayland_ctx_t *root_ctx, bool force, bool* needs_flush = 
 	if ( force )
 	{
         bool wants_vrr = cv_adaptive_sync;
-		uint32_t enabled_value = wants_vrr ? 1 : 0;
+		long enabled_value = wants_vrr ? 1 : 0;
 		XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeVRREnabled, XA_CARDINAL, 32, PropModeReplace,
 			(unsigned char *)&enabled_value, 1 );
 		if (needs_flush)
@@ -9349,11 +9368,12 @@ void update_limiter_atoms(xwayland_ctx_t *root_ctx, bool force, bool* needs_flus
 
 	g_uLimiterFeedback_CachedValue = uLimiterFeedback;
 
+	long lLimiterFeedback = uLimiterFeedback;
 	gamescope_xwayland_server_t *server = NULL;
 	for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
 	{
 		XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeLimiterFeedback, XA_CARDINAL, 32, PropModeReplace,
-			(unsigned char *)&uLimiterFeedback, 1 );
+			(unsigned char *)&lLimiterFeedback, 1 );
 
 		if (server->ctx.get() == root_ctx)
 		{
@@ -9376,7 +9396,7 @@ void update_mode_atoms(xwayland_ctx_t *root_ctx, bool* needs_flush = nullptr)
 	{
 		XDeleteProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeDisplayModeListExternal);
 
-		uint32_t zero = 0;
+		long zero = 0;
 		XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeDisplayIsExternal, XA_CARDINAL, 32, PropModeReplace,
 			(unsigned char *)&zero, 1 );
 		return;
@@ -9402,7 +9422,7 @@ void update_mode_atoms(xwayland_ctx_t *root_ctx, bool* needs_flush = nullptr)
 	XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeDisplayModeListExternal, XA_STRING, 8, PropModeReplace,
 		(unsigned char *)modes, strlen(modes) + 1 );
 	
-	uint32_t one = 1;
+	long one = 1;
 	XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeDisplayIsExternal, XA_CARDINAL, 32, PropModeReplace,
 		(unsigned char *)&one, 1 );
 }
@@ -10197,8 +10217,9 @@ steamcompmgr_main(int argc, char **argv)
 
 		if ( inputCounter != lastPublishedInputCounter )
 		{
+			long lInputCounter = inputCounter;
 			XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeInputCounterAtom, XA_CARDINAL, 32, PropModeReplace,
-							 (unsigned char *)&inputCounter, 1 );
+							 (unsigned char *)&lInputCounter, 1 );
 
 			lastPublishedInputCounter = inputCounter;
 			flush_root = true;
@@ -10206,7 +10227,7 @@ steamcompmgr_main(int argc, char **argv)
 
 		if ( const bool bFSRActive = g_eActiveUpscaler == GamescopeUpscaleFilter::FSR; bFSRActive != g_bWasFSRActive )
 		{
-			uint32_t active = bFSRActive ? 1 : 0;
+			long active = bFSRActive ? 1 : 0;
 			XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeFSRFeedback, XA_CARDINAL, 32, PropModeReplace,
 					(unsigned char *)&active, 1 );
 
@@ -10437,7 +10458,7 @@ steamcompmgr_main(int argc, char **argv)
 				gamescope_xwayland_server_t *server = NULL;
 				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
 				{
-					uint32_t hdr_value = ( bOutputHDRCapable || g_bForceHDRSupportDebug ) ? 1 : 0;
+					long hdr_value = ( bOutputHDRCapable || g_bForceHDRSupportDebug ) ? 1 : 0;
 					XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeHDROutputFeedback, XA_CARDINAL, 32, PropModeReplace,
 						(unsigned char *)&hdr_value, 1 );
 
@@ -10600,7 +10621,7 @@ steamcompmgr_main(int argc, char **argv)
 
 			if ( app_wants_hdr != g_bAppWantsHDRCached )
 			{
-				uint32_t app_wants_hdr_prop = app_wants_hdr ? 1 : 0;
+				long app_wants_hdr_prop = app_wants_hdr ? 1 : 0;
 
 				XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeColorAppWantsHDRFeedback, XA_CARDINAL, 32, PropModeReplace,
 						(unsigned char *)&app_wants_hdr_prop, 1 );
@@ -10617,9 +10638,10 @@ steamcompmgr_main(int argc, char **argv)
 					app_hdr_metadata_blob.resize((sizeof(hdr_metadata_infoframe) + (sizeof(uint32_t) - 1)) / sizeof(uint32_t));
 					memset(app_hdr_metadata_blob.data(), 0, sizeof(uint32_t) * app_hdr_metadata_blob.size());
 					memcpy(app_hdr_metadata_blob.data(), &app_hdr_metadata->View<hdr_output_metadata>().hdmi_metadata_type1, sizeof(hdr_metadata_infoframe));
+					std::vector<long> app_hdr_metadata_items( app_hdr_metadata_blob.begin(), app_hdr_metadata_blob.end() );
 
 					XChangeProperty(root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeColorAppHDRMetadataFeedback, XA_CARDINAL, 32, PropModeReplace,
-							(unsigned char *)app_hdr_metadata_blob.data(), (int)app_hdr_metadata_blob.size() );
+							(unsigned char *)app_hdr_metadata_items.data(), (int)app_hdr_metadata_items.size() );
 				}
 				else
 				{
