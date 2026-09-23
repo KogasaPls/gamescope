@@ -1,3 +1,9 @@
+> **This is a fork.** It carries a patch stack on upstream gamescope, mostly
+> for running gamescope nested under a wlroots compositor such as sway. The
+> patched source is the `patched/full-stack` branch. [PATCHES.md](PATCHES.md)
+> describes each patch, why it exists, its runtime switches, and where it
+> came from.
+
 ## gamescope: the micro-compositor formerly known as steamcompmgr
 
 In an embedded session usecase, gamescope does the same thing as steamcompmgr, but with less extra copies and latency:
