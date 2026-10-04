@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -174,7 +175,7 @@ static void request_buffer(struct pipewire_state *state)
 {
 	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
 	if (!pw_buffer) {
-		pwr_log.errorf("warning: out of buffers");
+		pwr_log.debugf("no free capture buffer; skipping frame");
 		return;
 	}
 
@@ -352,16 +353,25 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 
 	struct spa_gamescope gamescope_info{};
 
-	int ret = spa_format_video_raw_parse_with_gamescope(param, &state->video_info, &gamescope_info);
+	struct spa_video_info_raw video_info{};
+	int ret = spa_format_video_raw_parse_with_gamescope(param, &video_info, &gamescope_info);
 	if (ret < 0) {
 		pwr_log.errorf("spa_format_video_raw_parse failed");
 		return;
 	}
+	state->video_info = video_info;
 	s_nRequestedWidth = gamescope_info.requested_size.width;
 	s_nRequestedHeight = gamescope_info.requested_size.height;
 	calculate_capture_size();
 
 	state->gamescope_info = gamescope_info;
+
+	// Variable-rate consumers (e.g. WebRTC) negotiate maxFramerate instead
+	// of framerate. Respect it independently of the compositor refresh.
+	const auto &rate = state->video_info.framerate.num
+		? state->video_info.framerate : state->video_info.max_framerate;
+	state->capture_interval_nanos.store(
+		gamescope::pipewire_capture::Interval(rate.num, rate.denom));
 
 	int bpp = 4;
 	if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
@@ -758,6 +768,14 @@ bool pipewire_is_streaming()
 {
 	struct pipewire_state *state = &pipewire_state;
 	return state->streaming;
+}
+
+bool pipewire_capture_frame_due(int nRefreshmHz)
+{
+	const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	const uint64_t refreshPeriod = nRefreshmHz > 0 ? 1'000'000'000'000ull / nRefreshmHz : 0;
+	return pipewire_state.capture_pacer.Due(now, pipewire_state.capture_interval_nanos.load(), refreshPeriod);
 }
 
 struct pipewire_buffer *dequeue_pipewire_buffer(void)
