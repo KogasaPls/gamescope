@@ -15,6 +15,7 @@
 #include "hdr_metadata_sanitize.hpp"
 #include "Utils/TempFiles.h"
 #include "window_icon.hpp"
+#include "HostXTestMouse.hpp"
 
 #include <cstring>
 #include <unordered_map>
@@ -531,6 +532,8 @@ namespace gamescope
         ///////////////////
 
         virtual void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info ) override;
+        virtual bool ShouldPaintCursor() override;
+        virtual bool CompositedCursorAppliesHotspot() override;
         virtual void SetRelativeMouseMode( bool bRelative ) override;
         virtual void SetVisible( bool bVisible ) override;
         virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override;
@@ -640,6 +643,9 @@ namespace gamescope
         CWaylandBackend *m_pBackend = nullptr;
 
         CWaiter<4> m_Waiter;
+        std::unique_ptr<HostXTestMouse> m_pHostXTestMouse;
+        xtest_mouse::MotionPacer m_XTestMousePacer;
+        wl_surface *m_pXTestKeyboardSurface = nullptr;
 
         std::thread m_Thread;
         std::atomic<bool> m_bInitted = { false };
@@ -831,6 +837,20 @@ namespace gamescope
 
         wl_surface *CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info );
 
+        const bool m_bHostXTestMouseRequested = []() {
+            const char *xtest = getenv("GAMESCOPE_WAYLAND_XTEST_MOUSE");
+            return xtest && strcmp(xtest, "1") == 0;
+        }();
+
+        std::atomic<bool> m_bHostXTestMouseActive = { false };
+        bool m_bHostXTestCursorComposited = false;
+        void SetHostXTestMouseActive(bool active)
+        {
+            m_bHostXTestMouseActive = active;
+            nudge_steamcompmgr();
+        }
+        bool CompositesHostXTestCursor() const { return m_bHostXTestMouseActive.load() && m_bKeyboardEntered.load(); }
+
         bool SupportsColorManagement() const;
         bool SupportsGamescopeColorManagement() const { return m_WPColorManagerFeatures.bSupportsGamescopeColorManagement; }
         bool SupportsColorspaceOnPlane( GamescopeAppTextureColorspace eColorspace ) const;
@@ -1017,7 +1037,7 @@ namespace gamescope
         bool m_bMouseEntered = false;
         void NoteInputSerial( uint32_t uSerial ) { m_Selection.NoteInputSerial( uSerial ); }
         CWaylandSelection m_Selection;
-        bool m_bKeyboardEntered = false;
+        std::atomic<bool> m_bKeyboardEntered = { false };
 
         std::shared_ptr<INestedHints::CursorInfo> m_pCursorInfo;
         wl_surface *m_pCursorSurface = nullptr;
@@ -1545,6 +1565,16 @@ namespace gamescope
     void CWaylandConnector::SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info )
     {
         m_pBackend->SetCursorImage( std::move( info ) );
+    }
+    bool CWaylandConnector::ShouldPaintCursor()
+    {
+        // Host pointer coordinates do not move when the XTEST bridge moves
+        // the nested pointer. Render its cursor at the nested coordinates.
+        return m_pBackend->CompositesHostXTestCursor();
+    }
+    bool CWaylandConnector::CompositedCursorAppliesHotspot()
+    {
+        return ShouldPaintCursor();
     }
     void CWaylandConnector::SetRelativeMouseMode( bool bRelative )
     {
@@ -2671,6 +2701,12 @@ namespace gamescope
 
         wl_display_dispatch_pending( m_pDisplay );
 
+        if (CompositesHostXTestCursor() != m_bHostXTestCursorComposited)
+        {
+            m_bHostXTestCursorComposited = !m_bHostXTestCursorComposited;
+            UpdateCursor(); // backend thread owns cursor objects and Wayland requests
+            force_repaint(); // add or remove the composited cursor
+        }
         return false;
     }
 
@@ -2962,7 +2998,7 @@ namespace gamescope
             return;
 
         bool bUseHostCursor = !m_bKeyboardEntered;
-        bool bShowCursor = !m_bPointerLocked;
+        bool bShowCursor = !m_bPointerLocked && !CompositesHostXTestCursor();
 
         if ( cv_wayland_mouse_warp_without_keyboard_focus )
             bUseHostCursor &= m_bPointerLocked;
@@ -3297,6 +3333,18 @@ namespace gamescope
             return false;
         }
 
+        if (m_pBackend->m_bHostXTestMouseRequested)
+        {
+            m_pHostXTestMouse = std::make_unique<HostXTestMouse>();
+            // Init runs before main replaces DISPLAY with the nested server.
+            if (!m_pHostXTestMouse->Init(getenv("DISPLAY")))
+            {
+                xdg_log.errorf("Host XTEST mouse bridge unavailable; using normal Wayland input.");
+                m_pHostXTestMouse.reset();
+            }
+            else
+                xdg_log.infof("Host XTEST relative mouse bridge enabled (experimental).");
+        }
         m_bInitted = true;
         m_bInitted.notify_all();
         return true;
@@ -3337,10 +3385,25 @@ namespace gamescope
 
         CFunctionWaitable waitable( nFD );
         m_Waiter.AddWaitable( &waitable );
+        if (m_pHostXTestMouse)
+        {
+            if (!m_Waiter.AddWaitable(m_pHostXTestMouse.get()))
+                m_pHostXTestMouse.reset();
+            else
+                m_pBackend->SetHostXTestMouseActive(true);
+        }
+        defer(
+            if (m_pHostXTestMouse)
+            {
+                m_Waiter.RemoveWaitable(m_pHostXTestMouse.get());
+                m_pHostXTestMouse.reset();
+            }
+        );
 
         int nRet = 0;
         while ( m_Waiter.IsRunning() )
         {
+            int nPollTimeoutMs = -1;
             {
                 std::shared_lock dispatchLock{ m_mutCursorSurface };
 
@@ -3352,6 +3415,29 @@ namespace gamescope
 
                 if ( m_bPendingRelativePointerUpdate.exchange( false ) )
                     UpdateRelativePointer();
+
+                if (m_pHostXTestMouse)
+                {
+                    // Wayland focus events above take precedence over queued X input.
+                    const bool bFocused = m_bKeyboardEntered && m_pXTestKeyboardSurface;
+                    const uint64_t uNow = get_time_in_nanos();
+                    const auto batch = m_pHostXTestMouse->Dispatch(bFocused);
+                    if (const auto motion = m_XTestMousePacer.Step(batch, uNow, bFocused))
+                    {
+                        wlserver_lock();
+                        wlserver_mousemotion((*motion)[0], (*motion)[1], ++m_uFakeTimestamp);
+                        wlserver_unlock();
+                    }
+                    if (m_pHostXTestMouse->Failed())
+                    {
+                        xdg_log.errorf("Host XTEST recording failed or disconnected; disabling it until restart.");
+                        m_XTestMousePacer.Reset();
+                        m_Waiter.RemoveWaitable(m_pHostXTestMouse.get());
+                        m_pHostXTestMouse.reset();
+                        m_pBackend->SetHostXTestMouseActive(false);
+                    }
+                    nPollTimeoutMs = m_XTestMousePacer.PollTimeoutMs(uNow);
+                }
             }
 
             if ( ( nRet = wl_display_prepare_read_queue( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
@@ -3363,7 +3449,7 @@ namespace gamescope
                 abort();
             }
 
-            if ( ( nRet = m_Waiter.PollEvents() ) <= 0 )
+            if ( ( nRet = m_Waiter.PollEvents( nPollTimeoutMs ) ) <= 0 )
             {
                 wl_display_cancel_read( m_pBackend->GetDisplay() );
                 if ( nRet < 0 )
@@ -3376,6 +3462,14 @@ namespace gamescope
                 continue;
             }
 
+            // XTEST and nudge readiness do not imply Wayland socket readiness.
+            // Errors and hangups still reach wl_display_read_events and fail.
+            pollfd waylandPoll = { .fd = nFD, .events = POLLIN };
+            if (poll(&waylandPoll, 1, 0) == 0)
+            {
+                wl_display_cancel_read(m_pBackend->GetDisplay());
+                continue;
+            }
             if ( ( nRet = wl_display_read_events( m_pBackend->GetDisplay() ) ) < 0 )
             {
                 LogDisplayError( "Failed to read events on input thread", m_pBackend->GetDisplay() );
@@ -3405,6 +3499,11 @@ namespace gamescope
     {
         wl_surface *pExpected = pSurface;
         m_pCurrentCursorSurface.compare_exchange_strong( pExpected, nullptr );
+        if (m_pXTestKeyboardSurface == pSurface)
+        {
+            m_pXTestKeyboardSurface = nullptr;
+            m_XTestMousePacer.Reset();
+        }
     }
 
     void CWaylandInputThread::SetRelativePointer( bool bRelative )
@@ -3538,6 +3637,8 @@ namespace gamescope
 
         m_uScancodesHeld.clear();
         m_uScancodesConsumed.clear();
+        m_pXTestKeyboardSurface = nullptr;
+        m_XTestMousePacer.Reset();
     }
 
     // Registry
@@ -3813,9 +3914,14 @@ namespace gamescope
 		if ( !IsGamescopeToplevel( pSurface ) )
 			return;
 
-        m_bKeyboardEntered = true;
+        // Drop motion queued before acquiring focus instead of replaying it.
+        if (m_pHostXTestMouse)
+            m_pHostXTestMouse->Dispatch(false);
+        m_XTestMousePacer.Reset();
         if ( !m_uScancodesHeld.empty() )
             ReleaseHeldKeys();
+        m_pXTestKeyboardSurface = pSurface;
+        m_bKeyboardEntered = true;
 
         if ( m_ofPendingCursorX )
         {
