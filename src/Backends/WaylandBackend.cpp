@@ -15,6 +15,7 @@
 #include "hdr_metadata_sanitize.hpp"
 #include "Utils/TempFiles.h"
 #include "window_icon.hpp"
+#include "HostXTestInput.hpp"
 
 #include <cstring>
 #include <unordered_map>
@@ -531,6 +532,8 @@ namespace gamescope
         ///////////////////
 
         virtual void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info ) override;
+        virtual bool ShouldPaintCursor() override;
+        virtual bool CompositedCursorAppliesHotspot() override;
         virtual void SetRelativeMouseMode( bool bRelative ) override;
         virtual void SetVisible( bool bVisible ) override;
         virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override;
@@ -632,14 +635,18 @@ namespace gamescope
 
     private:
 
-        void HandleKey( uint32_t uKey, bool bPressed );
+        void HandleKey( uint32_t uKey, bool bPressed, xtest_input::KeySource eSource );
         void RunHotkey( uint32_t uKey );
         void ReleaseHeldKeys();
+        void ReleaseXTestKeys();
+        void PublishKeyboardModifiers();
         void UpdateRelativePointer();
 
         CWaylandBackend *m_pBackend = nullptr;
 
         CWaiter<4> m_Waiter;
+        std::unique_ptr<HostXTestInput> m_pHostXTestInput;
+        wl_surface *m_pXTestKeyboardSurface = nullptr;
 
         std::thread m_Thread;
         std::atomic<bool> m_bInitted = { false };
@@ -664,7 +671,6 @@ namespace gamescope
         xkb_context *m_pXkbContext = nullptr;
         xkb_keymap *m_pXkbKeymap = nullptr;
 
-        uint32_t m_uKeyModifiers = 0;
         uint32_t m_uModMask[ GAMESCOPE_WAYLAND_MOD_COUNT ];
 
         double m_flScrollAccum[2] = { 0.0, 0.0 };
@@ -678,7 +684,7 @@ namespace gamescope
         std::optional<wl_fixed_t> m_ofPendingCursorY;
 
         std::atomic<std::shared_ptr<zwp_relative_pointer_v1>> m_pRelativePointer = nullptr;
-        std::unordered_set<uint32_t> m_uScancodesHeld;
+        xtest_input::KeyboardState m_KeyboardState;
         std::unordered_set<uint32_t> m_uScancodesConsumed;
 
         std::unordered_map<int32_t, WaylandPlaneState> m_TouchPlaneStates;
@@ -831,6 +837,20 @@ namespace gamescope
 
         wl_surface *CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info );
 
+        const bool m_bHostXTestInputRequested = []() {
+            const char *xtest = getenv("GAMESCOPE_WAYLAND_XTEST_MOUSE");
+            return xtest && strcmp(xtest, "1") == 0;
+        }();
+
+        std::atomic<bool> m_bHostXTestInputActive = { false };
+        bool m_bHostXTestCursorComposited = false;
+        void SetHostXTestInputActive(bool active)
+        {
+            m_bHostXTestInputActive = active;
+            nudge_steamcompmgr();
+        }
+        bool CompositesHostXTestCursor() const { return m_bHostXTestInputActive.load() && m_pKeyboardFocusSurface.load(); }
+
         bool SupportsColorManagement() const;
         bool SupportsGamescopeColorManagement() const { return m_WPColorManagerFeatures.bSupportsGamescopeColorManagement; }
         bool SupportsColorspaceOnPlane( GamescopeAppTextureColorspace eColorspace ) const;
@@ -904,7 +924,14 @@ namespace gamescope
                 SetCaptureExtent( 0, 0 );
 
             if ( pSurface )
+            {
                 m_InputThread.ForgetSurfaceLocked( pSurface );
+                // A leave queued for a destroyed proxy may arrive with a null
+                // surface. Release cursor ownership before destroying it.
+                wl_surface *pExpectedSurface = pSurface;
+                if ( m_pKeyboardFocusSurface.compare_exchange_strong( pExpectedSurface, nullptr ) )
+                    nudge_steamcompmgr();
+            }
 
             if ( pSurface && ( pSurface == m_pRequestedRelativeSurface || pSurface == m_pLockedSurface ) )
             {
@@ -1017,7 +1044,7 @@ namespace gamescope
         bool m_bMouseEntered = false;
         void NoteInputSerial( uint32_t uSerial ) { m_Selection.NoteInputSerial( uSerial ); }
         CWaylandSelection m_Selection;
-        bool m_bKeyboardEntered = false;
+        std::atomic<wl_surface *> m_pKeyboardFocusSurface = { nullptr };
 
         std::shared_ptr<INestedHints::CursorInfo> m_pCursorInfo;
         wl_surface *m_pCursorSurface = nullptr;
@@ -1546,6 +1573,16 @@ namespace gamescope
     {
         m_pBackend->SetCursorImage( std::move( info ) );
     }
+    bool CWaylandConnector::ShouldPaintCursor()
+    {
+        // Host pointer coordinates do not move when the XTEST bridge moves
+        // the nested pointer. Render its cursor at the nested coordinates.
+        return m_pBackend->CompositesHostXTestCursor();
+    }
+    bool CWaylandConnector::CompositedCursorAppliesHotspot()
+    {
+        return ShouldPaintCursor();
+    }
     void CWaylandConnector::SetRelativeMouseMode( bool bRelative )
     {
         // TODO: Do more tracking across multiple connectors, and activity here if we ever want to use this.
@@ -1615,7 +1652,7 @@ namespace gamescope
 
     void CWaylandConnector::SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection )
     {
-        m_pBackend->m_Selection.SetSelection( std::move( szContents ), eSelection, m_pBackend->m_bKeyboardEntered );
+        m_pBackend->m_Selection.SetSelection( std::move( szContents ), eSelection, m_pBackend->m_pKeyboardFocusSurface.load() != nullptr );
     }
 
     //////////////////
@@ -2667,6 +2704,12 @@ namespace gamescope
 
         wl_display_dispatch_pending( m_pDisplay );
 
+        if (CompositesHostXTestCursor() != m_bHostXTestCursorComposited)
+        {
+            m_bHostXTestCursorComposited = !m_bHostXTestCursorComposited;
+            UpdateCursor(); // backend thread owns cursor objects and Wayland requests
+            force_repaint(); // add or remove the composited cursor
+        }
         return false;
     }
 
@@ -2957,8 +3000,8 @@ namespace gamescope
         if ( !m_pPointer || !m_bMouseEntered )
             return;
 
-        bool bUseHostCursor = !m_bKeyboardEntered;
-        bool bShowCursor = !m_bPointerLocked;
+        bool bUseHostCursor = !m_pKeyboardFocusSurface.load();
+        bool bShowCursor = !m_bPointerLocked && !CompositesHostXTestCursor();
 
         if ( cv_wayland_mouse_warp_without_keyboard_focus )
             bUseHostCursor &= m_bPointerLocked;
@@ -3144,7 +3187,7 @@ namespace gamescope
                 wl_keyboard_release( m_pKeyboard );
                 m_pKeyboard = nullptr;
 
-                m_bKeyboardEntered = false;
+                m_pKeyboardFocusSurface = nullptr;
                 UpdateCursor();
             }
             else
@@ -3183,7 +3226,7 @@ namespace gamescope
 			return;
 
         NoteInputSerial( uSerial );
-        m_bKeyboardEntered = true;
+        m_pKeyboardFocusSurface = pSurface;
 
         m_Selection.PublishPendingSelections();
 
@@ -3191,10 +3234,8 @@ namespace gamescope
     }
     void CWaylandBackend::Wayland_Keyboard_Leave( wl_keyboard *pKeyboard, uint32_t uSerial, wl_surface *pSurface )
     {
-		if ( !IsGamescopeToplevel( pSurface ) )
-			return;
-
-        m_bKeyboardEntered = false;
+        // Leave still ends focus when libwayland has nulled a destroyed surface.
+        m_pKeyboardFocusSurface = nullptr;
 
         UpdateCursor();
     }
@@ -3293,6 +3334,18 @@ namespace gamescope
             return false;
         }
 
+        if (m_pBackend->m_bHostXTestInputRequested)
+        {
+            m_pHostXTestInput = std::make_unique<HostXTestInput>();
+            // Init runs before main replaces DISPLAY with the nested server.
+            if (!m_pHostXTestInput->Init(getenv("DISPLAY")))
+            {
+                xdg_log.errorf("Host XTEST input bridge unavailable; using normal Wayland input.");
+                m_pHostXTestInput.reset();
+            }
+            else
+                xdg_log.infof("Host XTEST mouse and keyboard bridge enabled (experimental).");
+        }
         m_bInitted = true;
         m_bInitted.notify_all();
         return true;
@@ -3333,10 +3386,32 @@ namespace gamescope
 
         CFunctionWaitable waitable( nFD );
         m_Waiter.AddWaitable( &waitable );
+        if (m_pHostXTestInput)
+        {
+            if (!m_Waiter.AddWaitable(m_pHostXTestInput.get()) ||
+                !m_Waiter.AddWaitable(m_pHostXTestInput->CaptureWaitable()))
+            {
+                m_Waiter.RemoveWaitable(m_pHostXTestInput.get());
+                m_pHostXTestInput.reset();
+            }
+            else
+                m_pBackend->SetHostXTestInputActive(true);
+        }
+        defer(
+            if (m_pHostXTestInput)
+            {
+                std::shared_lock dispatchLock{ m_mutCursorSurface };
+                ReleaseXTestKeys();
+                m_Waiter.RemoveWaitable(m_pHostXTestInput.get());
+                m_Waiter.RemoveWaitable(m_pHostXTestInput->CaptureWaitable());
+                m_pHostXTestInput.reset();
+            }
+        );
 
         int nRet = 0;
         while ( m_Waiter.IsRunning() )
         {
+            int nPollTimeoutMs = -1;
             {
                 std::shared_lock dispatchLock{ m_mutCursorSurface };
 
@@ -3348,6 +3423,31 @@ namespace gamescope
 
                 if ( m_bPendingRelativePointerUpdate.exchange( false ) )
                     UpdateRelativePointer();
+
+                if (m_pHostXTestInput)
+                {
+                    // Wayland focus events above take precedence over queued X input.
+                    const bool bFocused = m_bKeyboardEntered && m_pXTestKeyboardSurface;
+                    const bool bMore = m_pHostXTestInput->Dispatch(bFocused, [&](uint32_t key, bool pressed) {
+                        HandleKey(key, pressed, xtest_input::KeySource::XTest);
+                    }, [&](double dx, double dy) {
+                        wlserver_lock();
+                        wlserver_mousemotion(dx, dy, ++m_uFakeTimestamp);
+                        wlserver_unlock();
+                    });
+                    if (m_pHostXTestInput->Failed())
+                    {
+                        xdg_log.errorf("Host XTEST capture or recording failed; disabling it until restart.");
+                        ReleaseXTestKeys();
+                        m_Waiter.RemoveWaitable(m_pHostXTestInput.get());
+                        m_Waiter.RemoveWaitable(m_pHostXTestInput->CaptureWaitable());
+                        m_pHostXTestInput.reset();
+                        m_pBackend->SetHostXTestInputActive(false);
+                    }
+                    // A zero timeout revisits buffered XCB data after polling
+                    // and dispatching Wayland focus events and shutdown nudges.
+                    nPollTimeoutMs = bMore && m_pHostXTestInput ? 0 : -1;
+                }
             }
 
             if ( ( nRet = wl_display_prepare_read_queue( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
@@ -3359,7 +3459,7 @@ namespace gamescope
                 abort();
             }
 
-            if ( ( nRet = m_Waiter.PollEvents() ) <= 0 )
+            if ( ( nRet = m_Waiter.PollEvents( nPollTimeoutMs ) ) <= 0 )
             {
                 wl_display_cancel_read( m_pBackend->GetDisplay() );
                 if ( nRet < 0 )
@@ -3372,6 +3472,14 @@ namespace gamescope
                 continue;
             }
 
+            // XTEST and nudge readiness do not imply Wayland socket readiness.
+            // Errors and hangups still reach wl_display_read_events and fail.
+            pollfd waylandPoll = { .fd = nFD, .events = POLLIN };
+            if (poll(&waylandPoll, 1, 0) == 0)
+            {
+                wl_display_cancel_read(m_pBackend->GetDisplay());
+                continue;
+            }
             if ( ( nRet = wl_display_read_events( m_pBackend->GetDisplay() ) ) < 0 )
             {
                 LogDisplayError( "Failed to read events on input thread", m_pBackend->GetDisplay() );
@@ -3401,6 +3509,12 @@ namespace gamescope
     {
         wl_surface *pExpected = pSurface;
         m_pCurrentCursorSurface.compare_exchange_strong( pExpected, nullptr );
+        if (m_pXTestKeyboardSurface == pSurface)
+        {
+            if (m_pHostXTestInput) m_pHostXTestInput->SetFocused(false);
+            ReleaseXTestKeys();
+            m_pXTestKeyboardSurface = nullptr;
+        }
     }
 
     void CWaylandInputThread::SetRelativePointer( bool bRelative )
@@ -3447,32 +3561,35 @@ namespace gamescope
         }
     }
 
-    void CWaylandInputThread::HandleKey( uint32_t uKey, bool bPressed )
+    void CWaylandInputThread::HandleKey( uint32_t uKey, bool bPressed, xtest_input::KeySource eSource )
     {
-        if ( bPressed )
+        // Consumed native shortcuts never own a forwarded key. In particular,
+        // a physical Meta+F must not consume or delay an emulated F hold.
+        if ( eSource == xtest_input::KeySource::Wayland )
         {
-            m_uScancodesHeld.insert( uKey );
-
-            if ( ( m_uKeyModifiers & m_uModMask[ GAMESCOPE_WAYLAND_MOD_META ] ) && IsHotkey( uKey ) )
+            if ( bPressed && m_uScancodesConsumed.contains( uKey ) )
+                return;
+            if ( !bPressed && m_uScancodesConsumed.erase( uKey ) )
+            {
+                RunHotkey( uKey );
+                return;
+            }
+            if ( bPressed && !m_KeyboardState.Held( eSource, uKey ) &&
+                 ( m_KeyboardState.WaylandModifiers() & m_uModMask[ GAMESCOPE_WAYLAND_MOD_META ] ) && IsHotkey( uKey ) )
             {
                 m_uScancodesConsumed.insert( uKey );
                 return;
             }
         }
-        else
+        const auto before = m_KeyboardState.CombinedModifiers();
+        if ( m_KeyboardState.Set( eSource, uKey, bPressed ) )
         {
-            m_uScancodesHeld.erase( uKey );
-
-            if ( m_uScancodesConsumed.erase( uKey ) )
-            {
-                RunHotkey( uKey );
-                return;
-            }
+            wlserver_lock();
+            wlserver_key( uKey, bPressed, ++m_uFakeTimestamp );
+            wlserver_unlock();
         }
-
-        wlserver_lock();
-        wlserver_key( uKey, bPressed, ++m_uFakeTimestamp );
-        wlserver_unlock();
+        if ( before != m_KeyboardState.CombinedModifiers() )
+            PublishKeyboardModifiers();
     }
 
     void CWaylandInputThread::RunHotkey( uint32_t uKey )
@@ -3520,19 +3637,41 @@ namespace gamescope
 
     void CWaylandInputThread::ReleaseHeldKeys()
     {
-        m_uKeyModifiers = 0;
-
         wlserver_lock();
-        for ( uint32_t uKey : m_uScancodesHeld )
+        for ( uint32_t uKey : m_KeyboardState.ReleaseAll() )
         {
-            if ( !m_uScancodesConsumed.contains( uKey ) )
-                wlserver_key( uKey, false, ++m_uFakeTimestamp );
+            wlserver_key( uKey, false, ++m_uFakeTimestamp );
         }
-        wlserver_keyboard_release_modifiers();
         wlserver_unlock();
-
-        m_uScancodesHeld.clear();
+        PublishKeyboardModifiers();
         m_uScancodesConsumed.clear();
+        m_pXTestKeyboardSurface = nullptr;
+        if (m_pHostXTestInput) m_pHostXTestInput->SetFocused(false);
+    }
+
+    void CWaylandInputThread::ReleaseXTestKeys()
+    {
+        const auto before = m_KeyboardState.CombinedModifiers();
+        const auto released = m_KeyboardState.ReleaseXTest();
+        if ( !released.empty() )
+        {
+            wlserver_lock();
+            for ( uint32_t uKey : released )
+            {
+                wlserver_key( uKey, false, ++m_uFakeTimestamp );
+            }
+            wlserver_unlock();
+        }
+        if ( before != m_KeyboardState.CombinedModifiers() )
+            PublishKeyboardModifiers();
+    }
+
+    void CWaylandInputThread::PublishKeyboardModifiers()
+    {
+        const auto mods = m_KeyboardState.CombinedModifiers();
+        wlserver_lock();
+        wlserver_modifiers( m_pXkbKeymap, mods.depressed, mods.latched, mods.locked, mods.group );
+        wlserver_unlock();
     }
 
     // Registry
@@ -3794,8 +3933,11 @@ namespace gamescope
             return;
         }
 
+        ReleaseXTestKeys();
         xkb_keymap_unref( m_pXkbKeymap );
         m_pXkbKeymap = pKeymap;
+        if ( !m_KeyboardState.SetKeymap( pKeymap ) )
+            xdg_log.errorf( "Couldn't create XTEST keyboard state; emulated keys will be ignored." );
 
         for ( uint32_t i = 0; i < GAMESCOPE_WAYLAND_MOD_COUNT; i++ )
         {
@@ -3808,9 +3950,13 @@ namespace gamescope
 		if ( !IsGamescopeToplevel( pSurface ) )
 			return;
 
-        m_bKeyboardEntered = true;
-        if ( !m_uScancodesHeld.empty() )
+        // Invalidate the old capture boundary before accepting this focus.
+        if (m_pHostXTestInput)
+            m_pHostXTestInput->Dispatch(false);
+        if ( !m_KeyboardState.Empty() || !m_uScancodesConsumed.empty() )
             ReleaseHeldKeys();
+        m_pXTestKeyboardSurface = pSurface;
+        m_bKeyboardEntered = true;
 
         if ( m_ofPendingCursorX )
         {
@@ -3834,21 +3980,16 @@ namespace gamescope
             return;
 
         const bool bPressed = uState == WL_KEYBOARD_KEY_STATE_PRESSED;
-        if ( m_uScancodesHeld.contains( uKey ) == bPressed )
-            return;
-
-        HandleKey( uKey, bPressed );
+        HandleKey( uKey, bPressed, xtest_input::KeySource::Wayland );
     }
     void CWaylandInputThread::Wayland_Keyboard_Modifiers( wl_keyboard *pKeyboard, uint32_t uSerial, uint32_t uModsDepressed, uint32_t uModsLatched, uint32_t uModsLocked, uint32_t uGroup )
     {
-        m_uKeyModifiers = uModsDepressed | uModsLatched | uModsLocked;
+        m_KeyboardState.SetWaylandModifiers( { uModsDepressed, uModsLatched, uModsLocked, uGroup } );
 
         if ( !m_bKeyboardEntered )
             return;
 
-        wlserver_lock();
-        wlserver_modifiers( m_pXkbKeymap, uModsDepressed, uModsLatched, uModsLocked, uGroup );
-        wlserver_unlock();
+        PublishKeyboardModifiers();
     }
     void CWaylandInputThread::Wayland_Keyboard_RepeatInfo( wl_keyboard *pKeyboard, int32_t nRate, int32_t nDelay )
     {

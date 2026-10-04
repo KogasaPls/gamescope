@@ -19,7 +19,7 @@ if patch_test_sources.length() > 0
 		'gamescope_patch_tests',
 		patch_test_sources,
 		include_directories: [include_directories('../src')],
-		dependencies: [catch2_dep, pixman_dep, wlroots_dep],
+		dependencies: [catch2_dep, pixman_dep, wlroots_dep, xkbcommon],
 		cpp_args: gamescope_cpp_args,
 	)
 	test('patch-stack', gamescope_patch_tests)

@@ -2448,7 +2448,7 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 	}
 
 	bool bNested = GetBackend()->GetCurrentMouseConnector() && GetBackend()->GetCurrentMouseConnector()->GetNestedHints();
-	if ( !bNested )
+	if ( !bNested || GetBackend()->GetCurrentMouseConnector()->GetNestedHints()->CompositedCursorAppliesHotspot() )
 	{
 		// Apply the cursor offset inside the texture using the display scale
 		scaledX = scaledX - (m_hotspotX * cursor_scale);
