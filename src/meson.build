@@ -9,12 +9,14 @@ dep_xtst = dependency('xtst')
 dep_xres = dependency('xres')
 dep_xmu = dependency('xmu')
 dep_xi = dependency('xi')
+dep_xcb_record = dependency('xcb-record')
+dep_xcb_input = dependency('xcb-xinput')
 
 drm_dep = dependency('libdrm', version: '>= 2.4.113', required: get_option('drm_backend'))
 eis_dep = dependency('libeis-1.0', required : get_option('input_emulation'))
 
 wayland_server = dependency('wayland-server', version: '>=1.23')
-xkbcommon = dependency('xkbcommon')
+xkbcommon = dependency('xkbcommon', version: '>= 1.10.0')
 thread_dep = dependency('threads')
 cap_dep = dependency('libcap', required: get_option('rt_cap'))
 epoll_dep = dependency('epoll-shim', required: false)
@@ -204,7 +206,7 @@ gamescope_version = configure_file(
     src, reshade_src, gamescope_version,
     include_directories : [reshade_include, sol2_include],
     dependencies: [
-      dep_wayland, dep_x11, dep_xdamage, dep_xcomposite, dep_xrender, dep_xext, dep_xfixes,
+      dep_xcb_record, dep_xcb_input, dep_wayland, dep_x11, dep_xdamage, dep_xcomposite, dep_xrender, dep_xext, dep_xfixes,
       dep_xxf86vm, dep_xres, glm_dep, drm_dep, wayland_server,
       xkbcommon, thread_dep, sdl2_dep, wlroots_dep,
       vulkan_dep, liftoff_dep, dep_xtst, dep_xmu, cap_dep, epoll_dep, pipewire_dep, librt_dep,
