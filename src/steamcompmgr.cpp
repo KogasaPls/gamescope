@@ -11312,7 +11312,7 @@ steamcompmgr_main(int argc, char **argv)
 
 #if HAVE_PIPEWIRE
 		// Drive on vblank, not the timer: under VRR the timer starves (page flips re-arm it).
-		if ( vblank && pipewire_is_streaming() )
+		if ( vblank && pipewire_is_streaming() && pipewire_capture_frame_due( GetVBlankTimer().GetRefresh() ) )
 			paint_pipewire();
 #endif
 
