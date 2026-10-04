@@ -6,6 +6,7 @@
 
 #include "rendervulkan.hpp"
 #include "pipewire_gamescope.hpp"
+#include "pipewire_capture_pacing.hpp"
 
 struct pipewire_state {
 	struct pw_loop *loop;
@@ -22,6 +23,9 @@ struct pipewire_state {
 	bool dmabuf;
 	int shm_stride;
 	uint64_t seq;
+	// Negotiated on the PipeWire thread; pacing is used only by steamcompmgr.
+	std::atomic<uint64_t> capture_interval_nanos{0};
+	gamescope::pipewire_capture::Pacer capture_pacer;
 };
 
 /**
@@ -59,6 +63,7 @@ bool init_pipewire(void);
 uint32_t get_pipewire_stream_node_id(void);
 struct pipewire_buffer *dequeue_pipewire_buffer(void);
 bool pipewire_is_streaming();
+bool pipewire_capture_frame_due(int nRefreshmHz);
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer);
 void push_pipewire_buffer(struct pipewire_buffer *buffer);
 void nudge_pipewire(void);
