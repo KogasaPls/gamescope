@@ -13,7 +13,7 @@ dep_xi = dependency('xi')
 drm_dep = dependency('libdrm', version: '>= 2.4.113', required: get_option('drm_backend'))
 eis_dep = dependency('libeis-1.0', required : get_option('input_emulation'))
 
-wayland_server = dependency('wayland-server', version: '>=1.21')
+wayland_server = dependency('wayland-server', version: '>=1.23')
 xkbcommon = dependency('xkbcommon')
 thread_dep = dependency('threads')
 cap_dep = dependency('libcap', required: get_option('rt_cap'))
