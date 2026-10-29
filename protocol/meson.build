@@ -5,7 +5,7 @@ wayland_scanner_path = wayland_scanner_dep.get_variable(pkgconfig: 'wayland_scan
 wayland_scanner = find_program(wayland_scanner_path, native: true)
 
 wayland_protos = dependency('wayland-protocols',
-	version: '>=1.39',
+	version: '>=1.43',
 	fallback: 'wayland-protocols',
 	default_options: ['tests=false'],
 )
@@ -26,6 +26,7 @@ protocols = [
 	wl_protocol_dir / 'staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
 	wl_protocol_dir / 'staging/tearing-control/tearing-control-v1.xml',
 	wl_protocol_dir / 'staging/content-type/content-type-v1.xml',
+	wl_protocol_dir / 'staging/xdg-toplevel-tag/xdg-toplevel-tag-v1.xml',
 
 	'color-management-v1.xml',
 

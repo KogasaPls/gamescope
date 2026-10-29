@@ -41,6 +41,7 @@
 #include <tearing-control-v1-client-protocol.h>
 #include <content-type-v1-client-protocol.h>
 #include <xdg-toplevel-icon-v1-client-protocol.h>
+#include <xdg-toplevel-tag-v1-client-protocol.h>
 #include "wlr_end.hpp"
 
 #include "drm_include.h"
@@ -346,6 +347,7 @@ namespace gamescope
         libdecor_frame *m_pFrame = nullptr;
         libdecor_window_state m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
         std::vector<wl_output *> m_pOutputs;
+        bool m_bAdaptiveSyncLaunchTagPending = false;
         bool m_bNeedsDecorCommit = false;
         bool m_bUnmappedAwaitingConfigure = false;
         bool m_bToplevelStateReset = false;
@@ -836,6 +838,7 @@ namespace gamescope
         wp_tearing_control_manager_v1 *GetTearingControlManager() const { return m_pTearingControlManager; }
         wp_content_type_manager_v1 *GetContentTypeManager() const { return m_pContentTypeManager; }
         xdg_toplevel_icon_manager_v1 *GetToplevelIconManager() const { return m_pToplevelIconManager; }
+        xdg_toplevel_tag_manager_v1 *GetToplevelTagManager() const { return m_pToplevelTagManager; }
         libdecor *GetLibDecor() const { return m_pLibDecor; }
 
         void UpdateFullscreenState();
@@ -935,6 +938,7 @@ namespace gamescope
         wp_tearing_control_manager_v1 *m_pTearingControlManager = nullptr;
         wp_content_type_manager_v1 *m_pContentTypeManager = nullptr;
         xdg_toplevel_icon_manager_v1 *m_pToplevelIconManager = nullptr;
+        xdg_toplevel_tag_manager_v1 *m_pToplevelTagManager = nullptr;
 
         // TODO: Restructure and remove the need for this.
         std::atomic<CWaylandConnector *> m_pFocusConnector;
@@ -1664,6 +1668,9 @@ namespace gamescope
         if ( !pParent )
         {
 			wl_proxy_set_tag( (wl_proxy *)m_pSurface, &GAMESCOPE_toplevel_tag );
+            // libdecor can defer creating the xdg_toplevel. Remember the launch
+            // preference until its first configure, before any content is mapped.
+            m_bAdaptiveSyncLaunchTagPending = cv_adaptive_sync && m_pBackend->GetToplevelTagManager();
             m_pFrame = libdecor_decorate( m_pBackend->GetLibDecor(), m_pSurface, &s_LibDecorFrameInterface, this );
             libdecor_frame_set_title( m_pFrame, "Gamescope" );
             libdecor_frame_set_app_id( m_pFrame, "gamescope" );
@@ -2088,6 +2095,13 @@ namespace gamescope
 
     void CWaylandPlane::LibDecor_Frame_Configure( libdecor_frame *pFrame, libdecor_configuration *pConfiguration )
     {
+        if ( m_bAdaptiveSyncLaunchTagPending )
+        {
+            xdg_toplevel_tag_manager_v1_set_toplevel_tag( m_pBackend->GetToplevelTagManager(),
+                libdecor_frame_get_xdg_toplevel( pFrame ), "adaptive-sync" );
+            m_bAdaptiveSyncLaunchTagPending = false;
+        }
+
 	    if ( !libdecor_configuration_get_window_state( pConfiguration, &m_eWindowState ) )
 		    m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
 
@@ -2345,6 +2359,8 @@ namespace gamescope
     CWaylandBackend::~CWaylandBackend()
     {
         m_Selection.Shutdown();
+        if ( m_pToplevelTagManager )
+            xdg_toplevel_tag_manager_v1_destroy( m_pToplevelTagManager );
     }
 
     bool CWaylandBackend::Init()
@@ -2951,6 +2967,10 @@ namespace gamescope
         else if ( !strcmp( pInterface, wp_content_type_manager_v1_interface.name ) )
         {
             m_pContentTypeManager = (wp_content_type_manager_v1 *)wl_registry_bind( pRegistry, uName, &wp_content_type_manager_v1_interface, 1u );
+        }
+        else if ( !strcmp( pInterface, xdg_toplevel_tag_manager_v1_interface.name ) )
+        {
+            m_pToplevelTagManager = (xdg_toplevel_tag_manager_v1 *)wl_registry_bind( pRegistry, uName, &xdg_toplevel_tag_manager_v1_interface, 1u );
         }
         else if ( !strcmp( pInterface, wl_shm_interface.name ) )
         {
