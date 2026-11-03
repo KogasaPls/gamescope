@@ -159,6 +159,12 @@ namespace gamescope::Process
         }
     }
 
+    void SignalDirectChildren( pid_t nParentPid, int nSignal )
+    {
+        for ( pid_t nPid : GetChildPids( nParentPid ) )
+            KillProcess( nPid, nSignal );
+    }
+
     void KillAllChildren( pid_t nParentPid, int nSignal )
     {
         std::vector<pid_t> nChildPids = GetChildPids( nParentPid );
