@@ -5,6 +5,7 @@
 #include <iosfwd>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include <sys/types.h>
 
@@ -16,6 +17,9 @@ namespace gamescope::Process
     // Matches against comm, which the kernel truncates to 15 chars.
     bool IsProcessRunning( const char *pszComm );
 
+    std::vector<pid_t> GetChildPids( pid_t nPid );
+
+    void SignalDirectChildren( pid_t nParentPid, int nSignal );
     void KillAllChildren( pid_t nParentPid, int nSignal );
     void KillProcess( pid_t nPid, int nSignal );
 

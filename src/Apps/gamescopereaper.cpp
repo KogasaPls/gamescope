@@ -37,7 +37,6 @@ namespace gamescope
 
         bool bRespawn = false;
         bool bNewSession = false;
-        static bool s_bRun = true;
 
         int nOptIndex = -1;
         int nOption = -1;
@@ -90,78 +89,79 @@ namespace gamescope
         if ( bNewSession )
             setsid();
 
-        // Set up a signal handler, so that SIGTERM, etc goes
-        // and kills all the children.
-        struct sigaction reaperSignalHandler{};
-        reaperSignalHandler.sa_handler = []( int nSignal )
+        // Handle child exits and shutdown in the same thread. SpawnProcess
+        // restores the child's signal mask before exec.
+        sigset_t signals;
+        sigemptyset( &signals );
+        for ( int sig : { SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGCHLD } )
+            sigaddset( &signals, sig );
+        if ( sigprocmask( SIG_BLOCK, &signals, nullptr ) < 0 )
         {
-            switch ( nSignal )
-            {
-            case SIGHUP:
-            case SIGINT:
-            case SIGQUIT:
-            case SIGTERM:
-                sigaction( SIGHUP, nullptr, nullptr );
-                sigaction( SIGINT, nullptr, nullptr );
-                sigaction( SIGQUIT, nullptr, nullptr );
-                sigaction( SIGTERM, nullptr, nullptr );
+            s_ReaperLog.errorf_errno( "Failed to block reaper signals" );
+            return 1;
+        }
 
-                if ( s_bRun )
-                {
-                    s_ReaperLog.infof( "Parent of gamescopereaper was killed. Killing children." );
-
-                    s_bRun = false;
-                    Process::KillAllChildren( getpid(), SIGTERM );
-                }
-                break;
-            }
-        };
-        sigaction( SIGHUP, &reaperSignalHandler, nullptr );
-        sigaction( SIGINT, &reaperSignalHandler, nullptr );
-        sigaction( SIGQUIT, &reaperSignalHandler, nullptr );
-        sigaction( SIGTERM, &reaperSignalHandler, nullptr );
-
-        // (Don't Lose) The Children
         Process::BecomeSubreaper();
         Process::SetDeathSignal( SIGTERM );
 
         pid_t nPrimaryChild = Process::SpawnProcess( &argv[ nSubCommandArgc ] );
-        assert( nPrimaryChild != 0 );
+        if ( nPrimaryChild < 0 )
+            return 1;
 
-        if ( nPrimaryChild > 0 )
+        bool stopping = false;
+        int exitStatus = 0;
+        auto stopChildren = [&]()
         {
-            // Wait for the primary child to die, then forward the death signal to
-            // all of the other children, if we aren't in a PID namespace.
-            if ( s_bRun )
-                Process::WaitForAllChildren( nPrimaryChild );
-
-            if ( bRespawn )
+            if ( stopping )
+                return;
+            stopping = true;
+            // Launch wrappers need not forward signals themselves. This
+            // reaper is the sole supervisor that signals its launched tree.
+            Process::KillAllChildren( getpid(), SIGTERM );
+        };
+        for ( ;; )
+        {
+            int sig;
+            const int err = sigwait( &signals, &sig );
+            if ( err )
             {
-                while ( s_bRun )
-                {
-                    s_ReaperLog.infof( "\"%s\" process shut down. Restarting.", argv[ nSubCommandArgc ] );
-
-                    nPrimaryChild = Process::SpawnProcess( &argv[ nSubCommandArgc ] );
-                    if ( s_bRun )
-                        Process::WaitForAllChildren( nPrimaryChild );
-                }
+                if ( err == EINTR )
+                    continue;
+                s_ReaperLog.errorf( "sigwait failed: %s", strerror( err ) );
+                return 1;
             }
 
-            s_bRun = false;
-            Process::KillAllChildren( getpid(), SIGTERM );
-            Process::WaitForAllChildren();
+            if ( sig != SIGCHLD )
+            {
+                stopChildren();
+                continue;
+            }
 
-            return 0;
-        }
-        else
-        {
-            s_ReaperLog.errorf_errno( "Failed to create child process \"%s\" in reaper.", argv[ nSubCommandArgc ] );
+            // SIGCHLD may cover multiple exits. Adopted children belong to
+            // this reaper too, and can outlive the primary launcher.
+            pid_t child;
+            while ( ( child = waitpid( -1, nullptr, WNOHANG ) ) > 0 )
+            {
+                if ( child != nPrimaryChild )
+                    continue;
 
-            s_bRun = false;
-            Process::KillAllChildren( getpid(), SIGTERM );
-            Process::WaitForAllChildren();
-
-            return 1;
+                nPrimaryChild = -1;
+                if ( !bRespawn )
+                    stopChildren();
+            }
+            const bool noChildren = child < 0 && errno == ECHILD;
+            if ( !stopping && bRespawn && nPrimaryChild < 0 )
+            {
+                s_ReaperLog.infof( "\"%s\" process shut down. Restarting.", argv[ nSubCommandArgc ] );
+                nPrimaryChild = Process::SpawnProcess( &argv[ nSubCommandArgc ] );
+                if ( nPrimaryChild < 0 )
+                {
+                    stopChildren();
+                    exitStatus = 1;
+                }
+            }
+            if ( stopping && noChildren )
+                return exitStatus;
         }
     }
 
