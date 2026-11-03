@@ -3342,7 +3342,7 @@ namespace gamescope
         return true;
     }
 
-    // The display connection is dead by the time we get here, so say why before we take the process with us.
+    // The display connection is dead by the time we get here, so say why before we shut down.
     static void LogDisplayError( const char *pszWhat, wl_display *pDisplay )
     {
         int nError = wl_display_get_error( pDisplay );
@@ -3375,7 +3375,10 @@ namespace gamescope
             abort();
         }
 
-        CFunctionWaitable waitable( nFD );
+        // The host closing the connection arrives as EPOLLHUP, which the
+        // default hang-up handler would turn into an abort.
+        bool bHungUp = false;
+        CFunctionWaitable waitable( nFD, nullptr, [&bHungUp]() { bHungUp = true; } );
         m_Waiter.AddWaitable( &waitable );
         if (m_pHostXTestInput)
         {
@@ -3409,7 +3412,8 @@ namespace gamescope
                 if ( ( nRet = wl_display_dispatch_queue_pending( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
                 {
                     LogDisplayError( "Failed to dispatch input thread queue", m_pBackend->GetDisplay() );
-                    abort();
+                    raise( SIGTERM );
+                    return;
                 }
 
                 if ( m_bPendingRelativePointerUpdate.exchange( false ) )
@@ -3447,7 +3451,8 @@ namespace gamescope
                     continue;
 
                 LogDisplayError( "Failed to prepare read of input thread queue", m_pBackend->GetDisplay() );
-                abort();
+                raise( SIGTERM );
+                return;
             }
 
             if ( ( nRet = m_Waiter.PollEvents( nPollTimeoutMs ) ) <= 0 )
@@ -3456,15 +3461,25 @@ namespace gamescope
                 if ( nRet < 0 )
                 {
                     xdg_log.errorf_errno( "Input thread poll failed" );
-                    abort();
+                    raise( SIGTERM );
+                    return;
                 }
 
                 assert( nRet == 0 );
                 continue;
             }
 
+            if ( bHungUp )
+            {
+                wl_display_cancel_read( m_pBackend->GetDisplay() );
+                xdg_log.errorf( "Host Wayland display hung up" );
+                raise( SIGTERM );
+                return;
+            }
+
             // XTEST and nudge readiness do not imply Wayland socket readiness.
-            // Errors and hangups still reach wl_display_read_events and fail.
+            // Errors still reach wl_display_read_events and fail; a hangup the
+            // waiter saw is handled above.
             pollfd waylandPoll = { .fd = nFD, .events = POLLIN };
             if (poll(&waylandPoll, 1, 0) == 0)
             {
@@ -3474,7 +3489,8 @@ namespace gamescope
             if ( ( nRet = wl_display_read_events( m_pBackend->GetDisplay() ) ) < 0 )
             {
                 LogDisplayError( "Failed to read events on input thread", m_pBackend->GetDisplay() );
-                abort();
+                raise( SIGTERM );
+                return;
             }
 
             // Reading also queues releases and presentation feedback for steamcompmgr.
