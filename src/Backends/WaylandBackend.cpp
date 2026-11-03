@@ -713,14 +713,21 @@ namespace gamescope
     protected:
         virtual void OnBackendBlobDestroyed( BackendBlob *pBlob ) override;
 
+        wl_buffer *CursorInfoToBuffer( const std::shared_ptr<INestedHints::CursorInfo> &info );
         wl_surface *CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info );
 
         bool SupportsColorManagement() const;
         bool SupportsWindowsBT2100() const;
 
         void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info );
+        void CommitCursorSurface();
+        void DestroyCursorSurface();
         void SetRelativeMouseMode( wl_surface *pSurface, bool bRelative );
         void UpdateCursor();
+
+        uint32_t GetGlobalFractionalScale() const { return m_uGlobalFractionalScale; }
+        void SetGlobalFractionalScale( uint32_t uScale ) { m_uGlobalFractionalScale = uScale; }
+        uint32_t GetCursorScale() const { return m_pCursorPlane ? m_pCursorPlane->GetScale() : 120; }
 
         friend CWaylandConnector;
         friend CWaylandPlane;
@@ -872,12 +879,15 @@ namespace gamescope
         std::unordered_map<uint32_t, wl_buffer *> m_ImportedFbs;
 
         uint32_t m_uPointerEnterSerial = 0;
-        bool m_bMouseEntered = false;
+        CWaylandPlane *m_pCursorPlane = nullptr;
         uint32_t m_uKeyboardEnterSerial = 0;
         bool m_bKeyboardEntered = false;
 
+        uint32_t m_uGlobalFractionalScale = 120;
+
         std::shared_ptr<INestedHints::CursorInfo> m_pCursorInfo;
         wl_surface *m_pCursorSurface = nullptr;
+        wp_viewport *m_pCursorViewport = nullptr;
         std::shared_ptr<INestedHints::CursorInfo> m_pDefaultCursorInfo;
         wl_surface *m_pDefaultCursorSurface = nullptr;
     };
@@ -1379,6 +1389,9 @@ namespace gamescope
     CWaylandPlane::~CWaylandPlane()
     {
         std::scoped_lock lock{ m_PlaneStateLock };
+
+        if ( m_pBackend->m_pCursorPlane == this )
+            m_pBackend->m_pCursorPlane = nullptr;
 
         m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
         m_pOutputs.clear();
@@ -1990,8 +2003,7 @@ namespace gamescope
 
         bool bDirty = false;
 
-        static uint32_t s_uGlobalFractionalScale = 120;
-        if ( s_uGlobalFractionalScale != uScale )
+        if ( m_pBackend->GetGlobalFractionalScale() != uScale )
         {
             if ( m_bHasRecievedScale )
             {
@@ -1999,13 +2011,18 @@ namespace gamescope
                 g_nOutputHeight = ( g_nOutputHeight * uScale ) / m_uFractionalScale;
             }
 
-            s_uGlobalFractionalScale = uScale;
+            m_pBackend->SetGlobalFractionalScale( uScale );
             bDirty = true;
         }
 
         if ( m_uFractionalScale != uScale )
         {
             m_uFractionalScale = uScale;
+            if ( m_pBackend->m_pCursorPlane == this && m_pBackend->m_pCursorSurface )
+            {
+                m_pBackend->CommitCursorSurface();
+                m_pBackend->UpdateCursor();
+            }
             bDirty = true;
         }
 
@@ -2443,9 +2460,17 @@ namespace gamescope
         // Do nothing.
     }
 
-    wl_surface *CWaylandBackend::CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info )
+    static const wl_buffer_listener s_CursorBufferListener =
     {
-        if ( !info )
+        .release = []( void *pData, wl_buffer *pBuffer )
+        {
+            wl_buffer_destroy( pBuffer );
+        },
+    };
+
+    wl_buffer *CWaylandBackend::CursorInfoToBuffer( const std::shared_ptr<INestedHints::CursorInfo> &info )
+    {
+        if ( !info || !info->uWidth || !info->uHeight )
             return nullptr;
 
         uint32_t uStride = info->uWidth * 4;
@@ -2457,10 +2482,22 @@ namespace gamescope
         defer( close( nFd ) );
 
         wl_shm_pool *pPool = wl_shm_create_pool( m_pShm, nFd, uSize );
+        if ( !pPool )
+            return nullptr;
         defer( wl_shm_pool_destroy( pPool ) );
 
         wl_buffer *pBuffer = wl_shm_pool_create_buffer( pPool, 0, info->uWidth, info->uHeight, uStride, WL_SHM_FORMAT_ARGB8888 );
-        defer( wl_buffer_destroy( pBuffer ) );
+        if ( pBuffer )
+            wl_buffer_add_listener( pBuffer, &s_CursorBufferListener, nullptr );
+
+        return pBuffer;
+    }
+
+    wl_surface *CWaylandBackend::CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info )
+    {
+        wl_buffer *pBuffer = CursorInfoToBuffer( info );
+        if ( !pBuffer )
+            return nullptr;
 
         wl_surface *pCursorSurface = wl_compositor_create_surface( m_pCompositor );
         wl_surface_attach( pCursorSurface, pBuffer, 0, 0 );
@@ -2484,15 +2521,44 @@ namespace gamescope
     {
         m_pCursorInfo = info;
 
-        if ( m_pCursorSurface )
+        wl_buffer *pBuffer = CursorInfoToBuffer( info );
+        if ( !pBuffer )
         {
-            wl_surface_destroy( m_pCursorSurface );
-            m_pCursorSurface = nullptr;
+            DestroyCursorSurface();
+            UpdateCursor();
+            return;
         }
 
-        m_pCursorSurface = CursorInfoToSurface( info );
+        if ( !m_pCursorSurface )
+        {
+            m_pCursorSurface = wl_compositor_create_surface( m_pCompositor );
+            m_pCursorViewport = wp_viewporter_get_viewport( m_pViewporter, m_pCursorSurface );
+        }
+
+        wl_surface_attach( m_pCursorSurface, pBuffer, 0, 0 );
+        wl_surface_damage( m_pCursorSurface, 0, 0, INT32_MAX, INT32_MAX );
+        CommitCursorSurface();
 
         UpdateCursor();
+    }
+    void CWaylandBackend::CommitCursorSurface()
+    {
+        // The image is in output pixels, so present it at its logical size
+        // rather than letting the host upscale it.
+        wp_viewport_set_destination( m_pCursorViewport,
+            WaylandScaleToLogical( m_pCursorInfo->uWidth, GetCursorScale() ),
+            WaylandScaleToLogical( m_pCursorInfo->uHeight, GetCursorScale() ) );
+        wl_surface_commit( m_pCursorSurface );
+    }
+    void CWaylandBackend::DestroyCursorSurface()
+    {
+        if ( m_pCursorViewport )
+            wp_viewport_destroy( m_pCursorViewport );
+        m_pCursorViewport = nullptr;
+
+        if ( m_pCursorSurface )
+            wl_surface_destroy( m_pCursorSurface );
+        m_pCursorSurface = nullptr;
     }
     void CWaylandBackend::SetRelativeMouseMode( wl_surface *pSurface, bool bRelative )
     {
@@ -2534,7 +2600,7 @@ namespace gamescope
     void CWaylandBackend::UpdateCursor()
     {
         // Skip if we don't have a pointer or if the pointer isn't over a gamescope plane (libdecor frame)
-        if ( !m_pPointer || !m_bMouseEntered )
+        if ( !m_pPointer || !m_pCursorPlane )
             return;
 
         bool bUseHostCursor = !m_bKeyboardEntered;
@@ -2546,7 +2612,9 @@ namespace gamescope
         if ( bUseHostCursor && m_pDefaultCursorSurface )
             wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, m_pDefaultCursorSurface, m_pDefaultCursorInfo->uXHotspot, m_pDefaultCursorInfo->uYHotspot );
         else if ( bShowCursor && m_pCursorSurface )
-            wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, m_pCursorSurface, m_pCursorInfo->uXHotspot, m_pCursorInfo->uYHotspot );
+            wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, m_pCursorSurface,
+                WaylandScalePositionToLogical( m_pCursorInfo->uXHotspot, GetCursorScale() ),
+                WaylandScalePositionToLogical( m_pCursorInfo->uYHotspot, GetCursorScale() ) );
         else
             wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, nullptr, 0, 0 );
     }
@@ -2700,6 +2768,7 @@ namespace gamescope
         {
             if ( m_pPointer )
             {
+                m_pCursorPlane = nullptr;
                 wl_pointer_release( m_pPointer );
                 m_pPointer = nullptr;
             }
@@ -2736,7 +2805,9 @@ namespace gamescope
 			return;
 
         m_uPointerEnterSerial = uSerial;
-        m_bMouseEntered = true;
+        m_pCursorPlane = static_cast<CWaylandPlane *>( wl_surface_get_user_data( pSurface ) );
+        if ( m_pCursorSurface )
+            CommitCursorSurface();
 
         UpdateCursor();
     }
@@ -2745,7 +2816,7 @@ namespace gamescope
 		if ( !IsGamescopeToplevel( pSurface ) )
 			return;
 
-        m_bMouseEntered = false;
+        m_pCursorPlane = nullptr;
     }
 
     // Keyboard
