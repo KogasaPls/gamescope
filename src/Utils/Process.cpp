@@ -4,6 +4,7 @@
 #include "../Utils/Defer.h"
 #include "../Utils/Parsers.h"
 #include "../Utils/String.h"
+#include "../proc_stat_helpers.hpp"
 
 #include <array>
 #include <cstdio>
@@ -97,8 +98,14 @@ namespace gamescope::Process
                 continue;
             defer( fclose( pStatFile ) );
 
-            pid_t nParentPid = -1;
-            fscanf( pStatFile, "%*d %*s %*c %d", &nParentPid );
+            // The command name may hold a newline, so the stat line is read whole.
+            char szStat[ 1024 ];
+            const size_t uStatSize = fread( szStat, 1, sizeof( szStat ) - 1, pStatFile );
+            if ( !uStatSize )
+                continue;
+            szStat[ uStatSize ] = '\0';
+
+            pid_t nParentPid = proc_stat::ParseLiveParentPid( szStat ).value_or( -1 );
             if ( nParentPid > 0 && nParentPid == nPid )
                 nPids.push_back( *Parse<pid_t>( pEntry->d_name ) );
         }
