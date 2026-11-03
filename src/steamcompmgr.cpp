@@ -2992,6 +2992,7 @@ static global_focus_t s_PipewireFocus{};
 static void paint_pipewire()
 {
 	static struct pipewire_buffer *s_pPipewireBuffer = nullptr;
+	const uint64_t ulCaptureGeneration = pipewire_capture_generation();
 
 	// If the stream stopped/changed, and the underlying pw_buffer was thus
 	// destroyed, then destroy this buffer and grab a new one.
@@ -3070,12 +3071,6 @@ static void paint_pipewire()
 	if ( !bAppIdMatches )
 		return;
 
-	// If the commits are the same as they were last time, don't repaint and don't push a new buffer on the stream.
-	static uint64_t s_ulLastFocusCommitId = 0;
-	static uint64_t s_ulLastOverrideCommitId = 0;
-	static uint64_t s_ulLastUnderlayCommitId = 0;
-	static uint64_t s_ulLastDecorationCommitId = 0;
-
 	uint64_t ulFocusCommitId = window_last_done_commit_id( pFocus->focusWindow );
 	uint64_t ulOverrideCommitId = window_last_done_commit_id( pFocus->overrideWindow );
 	// Combine the underlay and decoration commits so damage to any of them, or a change
@@ -3088,16 +3083,12 @@ static void paint_pipewire()
 	for ( steamcompmgr_win_t *decoration : pFocus->decorationWindows )
 		ulDecorationCommitId = ulDecorationCommitId * 31 + window_last_done_commit_id( decoration );
 
-	if ( ulFocusCommitId == s_ulLastFocusCommitId &&
-	     ulOverrideCommitId == s_ulLastOverrideCommitId &&
-	     ulUnderlayCommitId == s_ulLastUnderlayCommitId &&
-	     ulDecorationCommitId == s_ulLastDecorationCommitId )
+	// A new consumer or buffer format needs a first frame even on a static desktop.
+	const std::array captureFrame = { ulCaptureGeneration, s_pPipewireBuffer->format_generation,
+		ulFocusCommitId, ulOverrideCommitId, ulUnderlayCommitId, ulDecorationCommitId };
+	static std::optional<std::array<uint64_t, 6>> lastSubmittedFrame;
+	if ( lastSubmittedFrame == captureFrame )
 		return;
-
-	s_ulLastFocusCommitId = ulFocusCommitId;
-	s_ulLastOverrideCommitId = ulOverrideCommitId;
-	s_ulLastUnderlayCommitId = ulUnderlayCommitId;
-	s_ulLastDecorationCommitId = ulDecorationCommitId;
 
 	uint32_t uWidth = s_pPipewireBuffer->texture->width();
 	uint32_t uHeight = s_pPipewireBuffer->texture->height();
@@ -3166,6 +3157,7 @@ static void paint_pipewire()
 
 		push_pipewire_buffer( s_pPipewireBuffer );
 		s_pPipewireBuffer = nullptr;
+		lastSubmittedFrame = captureFrame;
 	}
 }
 #endif
