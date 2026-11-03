@@ -13,6 +13,13 @@ extern const char *gamescope_optstring;
 extern const struct option *gamescope_options;
 
 extern std::atomic< bool > g_bRun;
+// Set once an ordered shutdown is under way, while g_bRun may still be true
+// for the launched processes to exit; also set whenever g_bRun is cleared.
+extern std::atomic< bool > g_bShutdownRequested;
+
+// Starts the ordered shutdown a terminating signal would, from any thread. A
+// repeated request does not escalate it.
+void RequestOrderedShutdown();
 
 extern int g_nNestedWidth;
 extern int g_nNestedHeight;
