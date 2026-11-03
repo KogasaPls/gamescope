@@ -186,6 +186,12 @@ static void request_buffer(struct pipewire_state *state)
 	}
 
 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
+	if (!buffer) {
+		// Left dequeued, so it never reaches the consumer and is not
+		// dequeued again before the next renegotiation clears it.
+		pwr_log.warnf("withholding a capture buffer that failed to initialize");
+		return;
+	}
 	buffer->copying = true;
 
 	// Past this exchange, the PipeWire thread shares the buffer with the
@@ -600,7 +606,6 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 		spa_data->data = data;
 	} else {
 		pwr_log.errorf("unsupported data type");
-		spa_data->type = SPA_DATA_Invalid;
 		goto error;
 	}
 
@@ -609,12 +614,17 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	return;
 
 error:
+	spa_data->type = SPA_DATA_Invalid;
+	// PipeWire reuses pw_buffer slots without clearing user_data.
+	pw_buffer->user_data = nullptr;
 	delete buffer;
 }
 
 static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 {
 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
+	if (!buffer)
+		return;
 
 	// Read copying first: once buffer is null, steamcompmgr may destroy a
 	// buffer it holds.
