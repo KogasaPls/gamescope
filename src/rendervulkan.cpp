@@ -2066,7 +2066,7 @@ static bool allDMABUFsEqual( wlr_dmabuf_attributes *pDMA )
 	return true;
 }
 
-static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps)
+static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t modifier, VkExternalImageFormatProperties *externalFormatProps, VkImageFormatProperties *imageFormatProps = nullptr )
 {
 	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierFormatInfo = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
@@ -2103,7 +2103,10 @@ static VkResult getModifierProps( const VkImageCreateInfo *imageInfo, uint64_t m
 		.pNext = externalFormatProps,
 	};
 
-	return g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &imageFormatInfo, &imageProps);
+	VkResult res = g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &imageFormatInfo, &imageProps);
+	if ( res == VK_SUCCESS && imageFormatProps != nullptr )
+		*imageFormatProps = imageProps.imageFormatProperties;
+	return res;
 }
 
 static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
@@ -2293,7 +2296,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				VkExternalImageFormatProperties externalFormatProps = {
 					.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
 				};
-				res = getModifierProps( &imageInfo, modifier, &externalFormatProps );
+				VkImageFormatProperties formatProps = {};
+				res = getModifierProps( &imageInfo, modifier, &externalFormatProps, &formatProps );
 				if ( res == VK_ERROR_FORMAT_NOT_SUPPORTED )
 					continue;
 				else if ( res != VK_SUCCESS ) {
@@ -2302,6 +2306,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				}
 
 				if ( !( externalFormatProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) )
+					continue;
+
+				if ( imageInfo.extent.width > formatProps.maxExtent.width ||
+				     imageInfo.extent.height > formatProps.maxExtent.height ||
+				     imageInfo.extent.depth > formatProps.maxExtent.depth )
 					continue;
 
 				modifiers.push_back( modifier );
@@ -2319,7 +2328,11 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				return false;
 		}
 
-		assert( modifiers.size() > 0 );
+		if ( modifiers.empty() )
+		{
+			vk_log.errorf( "no usable modifier for a %ux%ux%u image of DRM format 0x%" PRIX32, width, height, depth, drmFormat );
+			return false;
+		}
 
 		modifierListInfo = {
 			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
