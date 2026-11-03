@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 
@@ -12,11 +13,19 @@ struct pipewire_state {
 	struct pw_loop *loop;
 	struct pw_context *context;
 	struct pw_core *core;
-	bool running;
 
 	struct pw_stream *stream;
-	uint32_t stream_node_id;
+	// Read by the wlserver thread, rewritten when the stream reconnects.
+	std::atomic<uint32_t> stream_node_id;
+	bool needs_reconnect;
+	int reconnect_attempts;
+	// Held by the PipeWire thread wherever buffers can be removed or the
+	// stream torn down. steamcompmgr only tries it around its dequeue, and
+	// skips the frame rather than wait.
+	std::mutex stream_lock;
 	std::atomic<bool> streaming;
+	std::atomic<uint64_t> capture_generation;
+	uint64_t format_generation;
 	struct spa_video_info_raw video_info;
 	struct spa_gamescope gamescope_info;
 	uint64_t focus_appid;
@@ -34,6 +43,7 @@ struct pipewire_state {
  * push_pipewire_buffer) for copying.
  */
 struct pipewire_buffer {
+	uint64_t format_generation;
 	enum spa_data_type type; // SPA_DATA_MemFd or SPA_DATA_DmaBuf
 	struct spa_video_info_raw video_info;
 	struct spa_gamescope gamescope_info;
@@ -56,13 +66,14 @@ struct pipewire_buffer {
 	}
 	// We pass the buffer to the steamcompmgr thread for copying. This is set
 	// to true if the buffer is currently owned by the steamcompmgr thread.
-	bool copying;
+	std::atomic<bool> copying;
 };
 
 bool init_pipewire(void);
 uint32_t get_pipewire_stream_node_id(void);
 struct pipewire_buffer *dequeue_pipewire_buffer(void);
 bool pipewire_is_streaming();
+uint64_t pipewire_capture_generation();
 bool pipewire_capture_frame_due(int nRefreshmHz);
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer);
 void push_pipewire_buffer(struct pipewire_buffer *buffer);
