@@ -173,6 +173,12 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
 
 static void request_buffer(struct pipewire_state *state)
 {
+	// The PipeWire thread holds the lock while it allocates buffers for a
+	// renegotiation, which outlasts a frame. Skip the frame instead.
+	std::unique_lock<std::mutex> lock(state->stream_lock, std::try_to_lock);
+	if (!lock.owns_lock() || !state->streaming)
+		return;
+
 	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
 	if (!pw_buffer) {
 		pwr_log.debugf("no free capture buffer; skipping frame");
@@ -328,16 +334,21 @@ static void stream_handle_state_changed(void *data, enum pw_stream_state old_str
 	case PW_STREAM_STATE_PAUSED:
 		if (state->stream_node_id == SPA_ID_INVALID) {
 			state->stream_node_id = pw_stream_get_node_id(state->stream);
+			pwr_log.infof("stream available on node ID: %u", state->stream_node_id.load());
 		}
 		state->streaming = false;
 		state->seq = 0;
+		state->reconnect_attempts = 0;
 		break;
 	case PW_STREAM_STATE_STREAMING:
 		state->streaming = true;
 		break;
 	case PW_STREAM_STATE_ERROR:
 	case PW_STREAM_STATE_UNCONNECTED:
-		state->running = false;
+		// A stream cannot be reconnected from its own callback, so
+		// run_pipewire() does it.
+		state->streaming = false;
+		state->needs_reconnect = true;
 		break;
 	default:
 		break;
@@ -605,9 +616,12 @@ static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 {
 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
 
+	// Read copying first: once buffer is null, steamcompmgr may destroy a
+	// buffer it holds.
+	bool copying = buffer->copying;
 	buffer->buffer = nullptr;
 
-	if (!buffer->copying) {
+	if (!copying) {
 		destroy_buffer(buffer);
 	}
 }
@@ -620,6 +634,47 @@ static const struct pw_stream_events stream_events = {
 	.remove_buffer = stream_handle_remove_buffer,
 	.process = nullptr,
 };
+
+static bool connect_stream(struct pipewire_state *state)
+{
+	s_nRequestedWidth = 0;
+	s_nRequestedHeight = 0;
+	s_nOutputWidth = g_nOutputWidth;
+	s_nOutputHeight = g_nOutputHeight;
+	calculate_capture_size();
+	state->capture_interval_nanos.store(0);
+
+	uint8_t buf[4096];
+	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
+
+	enum pw_stream_flags flags = (enum pw_stream_flags)(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS);
+	int ret = pw_stream_connect(state->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, format_params.data(), format_params.size());
+	if (ret != 0) {
+		pwr_log.errorf("pw_stream_connect failed");
+		return false;
+	}
+
+	return true;
+}
+
+static bool reconnect_stream(struct pipewire_state *state)
+{
+	if (state->reconnect_attempts >= 3) {
+		pwr_log.errorf("stream keeps failing, giving up");
+		return false;
+	}
+	state->reconnect_attempts++;
+
+	pwr_log.infof("stream lost, reconnecting");
+	std::lock_guard<std::mutex> lock(state->stream_lock);
+	pw_stream_disconnect(state->stream);
+	// Disconnecting reports UNCONNECTED synchronously, which sets
+	// needs_reconnect again.
+	state->needs_reconnect = false;
+	state->stream_node_id = SPA_ID_INVALID;
+	return connect_stream(state);
+}
 
 enum pipewire_event_type {
 	EVENT_PIPEWIRE,
@@ -642,7 +697,7 @@ static void run_pipewire(struct pipewire_state *state)
 		},
 	};
 
-	while (state->running) {
+	while (true) {
 		int ret = poll(pollfds, EVENT_COUNT, -1);
 		if (ret < 0) {
 			pwr_log.errorf_errno("poll failed");
@@ -657,8 +712,9 @@ static void run_pipewire(struct pipewire_state *state)
 		assert(!(pollfds[EVENT_NUDGE].revents & POLLHUP));
 
 		if (pollfds[EVENT_PIPEWIRE].revents & POLLIN) {
+			std::lock_guard<std::mutex> lock(state->stream_lock);
 			pw_loop_enter(state->loop);
-			ret = pw_loop_iterate(state->loop, -1);
+			ret = pw_loop_iterate(state->loop, 0);
 			pw_loop_leave(state->loop);
 			if (ret < 0) {
 				pwr_log.errorf("pw_loop_iterate failed");
@@ -669,9 +725,15 @@ static void run_pipewire(struct pipewire_state *state)
 		if (pollfds[EVENT_NUDGE].revents & POLLIN) {
 			dispatch_nudge(state, nudgePipe[0]);
 		}
+
+		if (state->needs_reconnect && !reconnect_stream(state)) {
+			break;
+		}
 	}
 
 	pwr_log.infof("exiting");
+	std::lock_guard<std::mutex> lock(state->stream_lock);
+	state->streaming = false;
 	pw_stream_destroy(state->stream);
 	pw_core_disconnect(state->core);
 	pw_context_destroy(state->context);
@@ -719,25 +781,11 @@ bool init_pipewire(void)
 	static struct spa_hook stream_hook;
 	pw_stream_add_listener(state->stream, &stream_hook, &stream_events, state);
 
-	s_nRequestedWidth = 0;
-	s_nRequestedHeight = 0;
-	s_nOutputWidth = g_nOutputWidth;
-	s_nOutputHeight = g_nOutputHeight;
-	calculate_capture_size();
-
-	uint8_t buf[4096];
-	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
-
-	enum pw_stream_flags flags = (enum pw_stream_flags)(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS);
-	int ret = pw_stream_connect(state->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, format_params.data(), format_params.size());
-	if (ret != 0) {
-		pwr_log.errorf("pw_stream_connect failed");
+	if (!connect_stream(state)) {
 		return false;
 	}
 
-	state->running = true;
-	ret = 0;
+	int ret = 0;
 	pw_loop_enter(state->loop);
 	while (state->stream_node_id == SPA_ID_INVALID) {
 		ret = pw_loop_iterate(state->loop, -1);
@@ -750,8 +798,6 @@ bool init_pipewire(void)
 		pwr_log.errorf("pw_loop_iterate failed");
 		return false;
 	}
-
-	pwr_log.infof("stream available on node ID: %u", state->stream_node_id);
 
 	std::thread thread(run_pipewire, state);
 	thread.detach();
