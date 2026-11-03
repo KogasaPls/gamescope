@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 
@@ -12,10 +13,16 @@ struct pipewire_state {
 	struct pw_loop *loop;
 	struct pw_context *context;
 	struct pw_core *core;
-	bool running;
 
 	struct pw_stream *stream;
-	uint32_t stream_node_id;
+	// Read by the wlserver thread, rewritten when the stream reconnects.
+	std::atomic<uint32_t> stream_node_id;
+	bool needs_reconnect;
+	int reconnect_attempts;
+	// Held by the PipeWire thread wherever buffers can be removed or the
+	// stream torn down. steamcompmgr only tries it around its dequeue, and
+	// skips the frame rather than wait.
+	std::mutex stream_lock;
 	std::atomic<bool> streaming;
 	struct spa_video_info_raw video_info;
 	struct spa_gamescope gamescope_info;
@@ -56,7 +63,7 @@ struct pipewire_buffer {
 	}
 	// We pass the buffer to the steamcompmgr thread for copying. This is set
 	// to true if the buffer is currently owned by the steamcompmgr thread.
-	bool copying;
+	std::atomic<bool> copying;
 };
 
 bool init_pipewire(void);
