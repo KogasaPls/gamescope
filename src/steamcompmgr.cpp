@@ -5943,7 +5943,7 @@ handle_desktop_window(steamcompmgr_win_t *w)
 
 	xwayland_ctx_t *ctx = w->xwayland().ctx;
 
-	if ( w->sizeHintsSpecified && !(window_is_fullscreen( w ) || ctx->force_windows_fullscreen) )
+	if ( w->sizeHintsSpecified && !(window_is_fullscreen( w ) || w->isMaximized || ctx->force_windows_fullscreen) )
 	{
 		if ((unsigned)w->GetGeometry().nWidth != w->requestedWidth || (unsigned)w->GetGeometry().nHeight != w->requestedHeight)
 		{
