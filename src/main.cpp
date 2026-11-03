@@ -17,6 +17,9 @@
 #include <sys/resource.h>
 
 #include <getopt.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <unistd.h>
 #include <float.h>
@@ -28,6 +31,7 @@
 #include "wlserver.hpp"
 #include "convar.h"
 #include "gpuvis_trace_utils.h"
+#include "ordered_shutdown_helpers.hpp"
 #include "Utils/Defer.h"
 #include "Utils/Parsers.h"
 #include "Utils/Process.h"
@@ -485,6 +489,13 @@ static float parse_float(const char *str, const char *optionName)
 
 struct sigaction handle_signal_action = {};
 
+static LogScope s_ShutdownLog( "shutdown" );
+
+static gamescope::ConVar<int> cv_shutdown_grace_period_ms( "shutdown_grace_period_ms", 10000, "How long a terminating signal keeps the display up for the launched processes to exit before they are killed. 0 shuts down at once." );
+
+static int s_nSignalPipe[2] = { -1, -1 };
+static constexpr int k_nStopSignalThread = 0;
+
 void ShutdownGamescope()
 {
 	g_bRun = false;
@@ -492,14 +503,50 @@ void ShutdownGamescope()
 	nudge_steamcompmgr();
 }
 
+static bool HasLiveChildren()
+{
+	return !gamescope::Process::GetChildPids( getpid() ).empty();
+}
+
+static void KillChildrenAndShutdown()
+{
+	gamescope::Process::KillAllChildren( getpid(), SIGKILL );
+	ShutdownGamescope();
+}
+
+static void RunShutdownStep( gamescope::ordered_shutdown::Step eStep )
+{
+	using gamescope::ordered_shutdown::Step;
+
+	switch ( eStep ) {
+	case Step::Wait:
+		break;
+	case Step::SignalChildren:
+		s_ShutdownLog.infof( "Shutdown requested, asking the launched processes to exit within %d ms.", int( cv_shutdown_grace_period_ms ) );
+		gamescope::Process::KillAllChildren( getpid(), SIGTERM );
+		break;
+	case Step::Shutdown:
+		ShutdownGamescope();
+		break;
+	case Step::ForceShutdown:
+		s_ShutdownLog.infof( "Shutdown requested again, killing the launched processes." );
+		KillChildrenAndShutdown();
+		break;
+	case Step::GraceExpired:
+		s_ShutdownLog.warnf( "The launched processes did not exit within %d ms, killing them.", int( cv_shutdown_grace_period_ms ) );
+		KillChildrenAndShutdown();
+		break;
+	}
+}
+
 static gamescope::ConCommand cc_shutdown( "shutdown", "Cleanly shutdown gamescope",
 []( std::span<std::string_view> svArgs )
 {
 	console_log.infof( "Shutting down..." );
-	ShutdownGamescope();
+	raise( SIGTERM );
 });
 
-static void handle_signal( int sig )
+static void handle_signal( gamescope::ordered_shutdown::State &shutdownState, int sig )
 {
 	switch ( sig ) {
 	case SIGUSR2:
@@ -509,13 +556,55 @@ static void handle_signal( int sig )
 	case SIGQUIT:
 	case SIGTERM:
 	case SIGINT:
-		ShutdownGamescope();
+		if ( g_bRun )
+		{
+			const uint64_t ulGraceNanos = gamescope::ordered_shutdown::GraceNanosFromMs( cv_shutdown_grace_period_ms );
+			RunShutdownStep( gamescope::ordered_shutdown::OnTerminatingSignal( shutdownState, HasLiveChildren(), get_time_in_nanos(), ulGraceNanos ) );
+		}
 		break;
 	case SIGUSR1:
 		fprintf( stderr, "gamescope: hi :3\n" );
 		break;
 	default:
 		assert( false ); // unreachable
+	}
+}
+
+// Runs on whichever thread the signal lands on, so it may only do
+// async-signal-safe work.
+static void queue_signal( int sig )
+{
+	int nSavedErrno = errno;
+	ssize_t ret = write( s_nSignalPipe[1], &sig, sizeof( sig ) );
+	(void) ret;
+	errno = nSavedErrno;
+}
+
+static void SignalThreadRun()
+{
+	pthread_setname_np( pthread_self(), "gamescope-sig" );
+
+	gamescope::ordered_shutdown::State shutdownState;
+	pollfd signalPollFd = { .fd = s_nSignalPipe[0], .events = POLLIN };
+	for ( ;; )
+	{
+		const int nTimeoutMs = g_bRun ? gamescope::ordered_shutdown::PollTimeoutMs( shutdownState, get_time_in_nanos() ) : -1;
+		if ( poll( &signalPollFd, 1, nTimeoutMs ) < 0 && errno != EINTR )
+		{
+			s_ShutdownLog.errorf_errno( "Signal thread poll failed" );
+			return;
+		}
+
+		int nSignal = 0;
+		while ( read( s_nSignalPipe[0], &nSignal, sizeof( nSignal ) ) == sizeof( nSignal ) )
+		{
+			if ( nSignal == k_nStopSignalThread )
+				return;
+			handle_signal( shutdownState, nSignal );
+		}
+
+		if ( g_bRun && shutdownState.ePhase == gamescope::ordered_shutdown::Phase::WaitingForChildren )
+			RunShutdownStep( gamescope::ordered_shutdown::OnChildrenChecked( shutdownState, HasLiveChildren(), get_time_in_nanos() ) );
 	}
 }
 
@@ -1112,9 +1201,16 @@ int main(int argc, char **argv)
 	logind_sleep_init();
 #endif
 
+	if ( pipe2( s_nSignalPipe, O_CLOEXEC | O_NONBLOCK ) != 0 )
+	{
+		fprintf( stderr, "Failed to create the signal pipe\n" );
+		return 1;
+	}
+	std::thread signalThread( SignalThreadRun );
+
 	std::thread steamCompMgrThread( steamCompMgrThreadRun, argc, argv );
 
-	handle_signal_action.sa_handler = handle_signal;
+	handle_signal_action.sa_handler = queue_signal;
 	sigaction(SIGHUP, &handle_signal_action, nullptr);
 	sigaction(SIGINT, &handle_signal_action, nullptr);
 	sigaction(SIGQUIT, &handle_signal_action, nullptr);
@@ -1125,6 +1221,12 @@ int main(int argc, char **argv)
 	wlserver_run();
 
 	steamCompMgrThread.join();
+
+	// The pipe stays open until exit: a handler may still run on another
+	// thread, and a closed write end could be reused by then, while a closed
+	// read end would raise SIGPIPE.
+	queue_signal( k_nStopSignalThread );
+	signalThread.join();
 
 	gamescope::Process::KillAllChildren( getpid(), SIGTERM );
 	gamescope::Process::WaitForAllChildren();
