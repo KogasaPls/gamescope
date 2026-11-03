@@ -755,6 +755,12 @@ namespace gamescope
             return &iter->second;
         }
 
+        // The fbs the host holds, so they can be released when it goes away
+        // and its wl_buffer.release events never come. steamcompmgr thread only.
+        void OnFbAcquired( CWaylandFb *pFb ) { m_HostHeldFbs.push_back( pFb ); }
+        void OnFbReleased( CWaylandFb *pFb ) { std::erase( m_HostHeldFbs, pFb ); }
+        void ReleaseHostHeldFbs();
+
 		wl_region *GetEmptyRegion() const { return m_pEmptyRegion; }
         wl_region *GetFullRegion() const { return m_pFullRegion; }
         CWaylandFb *GetBlackFb() const { return m_BlackFb.get(); }
@@ -824,6 +830,7 @@ namespace gamescope
         Rc<CWaylandFb> m_BlackFb;
         OwningRc<CWaylandFb> m_pOwnedBlackFb;
         OwningRc<CVulkanTexture> m_pBlackTexture;
+        std::vector<CWaylandFb *> m_HostHeldFbs;
         wp_presentation *m_pPresentation = nullptr;
         frog_color_management_factory_v1 *m_pFrogColorMgmtFactory = nullptr;
         wp_color_manager_v1 *m_pWPColorManager = nullptr;
@@ -978,6 +985,7 @@ namespace gamescope
         {
             m_bCompositorAcquired = true;
             IncRef();
+            m_pBackend->OnFbAcquired( this );
         }
     }
 
@@ -989,6 +997,7 @@ namespace gamescope
         if ( m_bCompositorAcquired )
         {
             m_bCompositorAcquired = false;
+            m_pBackend->OnFbReleased( this );
             DecRef();
         }
         else
@@ -2236,6 +2245,13 @@ namespace gamescope
     void CWaylandBackend::DirtyState( bool bForce, bool bForceModeset )
     {
     }
+    void CWaylandBackend::ReleaseHostHeldFbs()
+    {
+        // OnCompositorRelease() takes the fb off the list.
+        while ( !m_HostHeldFbs.empty() )
+            m_HostHeldFbs.back()->OnCompositorRelease();
+    }
+
     bool CWaylandBackend::PollState()
     {
         wl_display_flush( m_pDisplay );
@@ -2261,6 +2277,12 @@ namespace gamescope
         }
 
         wl_display_dispatch_pending( m_pDisplay );
+
+        // A dead connection delivers no more wl_buffer.release events. Hand
+        // back what the host held, so clients have their buffers during the
+        // shutdown grace period.
+        if ( wl_display_get_error( m_pDisplay ) )
+            ReleaseHostHeldFbs();
 
         return false;
     }
@@ -2873,7 +2895,7 @@ namespace gamescope
         return true;
     }
 
-    // The display connection is dead by the time we get here, so say why before we take the process with us.
+    // The display connection is dead by the time we get here, so say why before we shut down.
     static void LogDisplayError( const char *pszWhat, wl_display *pDisplay )
     {
         int nError = wl_display_get_error( pDisplay );
@@ -2906,7 +2928,10 @@ namespace gamescope
             abort();
         }
 
-        CFunctionWaitable waitable( nFD );
+        // The host closing the connection arrives as EPOLLHUP, which the
+        // default hang-up handler would turn into an abort.
+        bool bHungUp = false;
+        CFunctionWaitable waitable( nFD, nullptr, [&bHungUp]() { bHungUp = true; } );
         m_Waiter.AddWaitable( &waitable );
 
         int nRet = 0;
@@ -2915,7 +2940,8 @@ namespace gamescope
             if ( ( nRet = wl_display_dispatch_queue_pending( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
             {
                 LogDisplayError( "Failed to dispatch input thread queue", m_pBackend->GetDisplay() );
-                abort();
+                raise( SIGTERM );
+                return;
             }
 
             if ( ( nRet = wl_display_prepare_read_queue( m_pBackend->GetDisplay(), m_pQueue ) ) < 0 )
@@ -2924,7 +2950,8 @@ namespace gamescope
                     continue;
 
                 LogDisplayError( "Failed to prepare read of input thread queue", m_pBackend->GetDisplay() );
-                abort();
+                raise( SIGTERM );
+                return;
             }
 
             if ( ( nRet = m_Waiter.PollEvents() ) <= 0 )
@@ -2933,17 +2960,27 @@ namespace gamescope
                 if ( nRet < 0 )
                 {
                     xdg_log.errorf_errno( "Input thread poll failed" );
-                    abort();
+                    raise( SIGTERM );
+                    return;
                 }
 
                 assert( nRet == 0 );
                 continue;
             }
 
+            if ( bHungUp )
+            {
+                wl_display_cancel_read( m_pBackend->GetDisplay() );
+                xdg_log.errorf( "Host Wayland display hung up" );
+                raise( SIGTERM );
+                return;
+            }
+
             if ( ( nRet = wl_display_read_events( m_pBackend->GetDisplay() ) ) < 0 )
             {
                 LogDisplayError( "Failed to read events on input thread", m_pBackend->GetDisplay() );
-                abort();
+                raise( SIGTERM );
+                return;
             }
 
             // Reading also queues releases and presentation feedback for steamcompmgr.
