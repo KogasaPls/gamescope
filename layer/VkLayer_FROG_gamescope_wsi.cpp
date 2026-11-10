@@ -881,6 +881,42 @@ namespace GamescopeWSILayer {
     return VK_SUCCESS;
   }
 
+  // vkroots finds a device's queues with vkGetDeviceQueue, which returns no
+  // handle for a queue created with flags, so a call on such a queue finds no
+  // dispatch. The layer adds and removes the dispatch of those queues itself.
+  template<typename Function>
+  static void forEachFlaggedQueue(const vkroots::VkDeviceDispatch &dispatch, VkDevice device, Function function) {
+    for (const VkDeviceQueueCreateInfo &createInfo : dispatch.DeviceQueueInfos) {
+      if (!createInfo.flags)
+        continue;
+      for (uint32_t i = 0; i < createInfo.queueCount; i++) {
+        const VkDeviceQueueInfo2 queueInfo = {
+          .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
+          .flags            = createInfo.flags,
+          .queueFamilyIndex = createInfo.queueFamilyIndex,
+          .queueIndex       = i,
+        };
+        VkQueue queue = VK_NULL_HANDLE;
+        dispatch.GetDeviceQueue2(device, &queueInfo, &queue);
+        if (queue)
+          function(queue);
+      }
+    }
+  }
+
+  static VkResult createDevice(const vkroots::VkPhysicalDeviceDispatch &dispatch, VkPhysicalDevice physicalDevice,
+      const VkDeviceCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkDevice *pDevice) {
+    VkResult result = dispatch.CreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    if (result != VK_SUCCESS)
+      return result;
+
+    const vkroots::VkDeviceDispatch *pDeviceDispatch = vkroots::LookupDispatch(*pDevice);
+    forEachFlaggedQueue(*pDeviceDispatch, *pDevice, [pDeviceDispatch](VkQueue queue) {
+      vkroots::tables::AssignDispatchTable(queue, pDeviceDispatch);
+    });
+    return result;
+  }
+
   class VkInstanceOverrides {
   public:
     static VkResult CreateInstance(
@@ -991,7 +1027,7 @@ namespace GamescopeWSILayer {
       const VkAllocationCallbacks*       pAllocator,
             VkDevice*                    pDevice) {
       if (!gamescopeInstances.find(pDispatch.pInstanceDispatch->Instance))
-        return pDispatch.CreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+        return createDevice(pDispatch, physicalDevice, pCreateInfo, pAllocator, pDevice);
       VkDeviceCreateInfo deviceCreateInfo = *pCreateInfo;
       std::vector<VkExtensionProperties> driverExtensions;
       VkResult extensionResult = enumerateValues(std::bind_front(&vkroots::VkPhysicalDeviceDispatch::EnumerateDeviceExtensionProperties, &pDispatch),
@@ -1017,7 +1053,7 @@ namespace GamescopeWSILayer {
         return true;
       });
 
-      return pDispatch.CreateDevice(physicalDevice, &deviceCreateInfo, pAllocator, pDevice);
+      return createDevice(pDispatch, physicalDevice, &deviceCreateInfo, pAllocator, pDevice);
     }
 
     static VkBool32 GetPhysicalDeviceXcbPresentationSupportKHR(
@@ -1496,6 +1532,7 @@ namespace GamescopeWSILayer {
       const vkroots::VkDeviceDispatch &dispatch, VkDevice device, const VkAllocationCallbacks *allocator) {
       // As with instance teardown, table cleanup invalidates dispatch itself.
       auto destroy = reinterpret_cast<PFN_vkDestroyDevice>(dispatch.GetDeviceProcAddr(device, "vkDestroyDevice"));
+      forEachFlaggedQueue(dispatch, device, [](VkQueue queue) { vkroots::tables::UnassignDispatchTable(queue); });
       vkroots::tables::DestroyDispatchTable(device);
       destroy(device, allocator);
     }
