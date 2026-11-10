@@ -202,7 +202,16 @@ namespace gamescope
         GamescopeAppTextureColorspace eColorspace;
         std::shared_ptr<gamescope::BackendBlob> pHDRMetadata;
 
-        bool operator ==( const WaylandPlaneColorState &other ) const = default;
+        // A client can send the same metadata again in a new blob, and each
+        // new image description is a wait on the host.
+        bool operator ==( const WaylandPlaneColorState &other ) const
+        {
+            if ( eColorspace != other.eColorspace )
+                return false;
+            if ( pHDRMetadata == other.pHDRMetadata )
+                return true;
+            return pHDRMetadata && other.pHDRMetadata && std::ranges::equal( pHDRMetadata->GetData(), other.pHDRMetadata->GetData() );
+        }
         bool operator !=( const WaylandPlaneColorState &other ) const = default;
     };
 
@@ -738,6 +747,11 @@ namespace gamescope
         wp_presentation *GetPresentation() const { return m_pPresentation; }
         frog_color_management_factory_v1 *GetFrogColorManagementFactory() const { return m_pFrogColorMgmtFactory; }
         wp_color_manager_v1 *GetWPColorManager() const { return m_pWPColorManager; }
+        // Image descriptions are created through these so that they are born
+        // on their own queue, which WaitForImageDescription() dispatches.
+        wp_color_manager_v1 *GetImageDescriptionFactory() const { return m_pImageDescriptionFactory; }
+        wl_event_queue *GetImageDescriptionQueue() const { return m_pImageDescriptionQueue; }
+        bool WaitForImageDescription( wp_image_description_v1 *pImageDescription );
         wp_image_description_v1 *GetWPImageDescription( GamescopeAppTextureColorspace eColorspace ) const { return m_pWPImageDescriptions[ (uint32_t)eColorspace ]; }
         wp_fractional_scale_manager_v1 *GetFractionalScaleManager() const { return m_pFractionalScaleManager; }
         xdg_toplevel_icon_manager_v1 *GetToplevelIconManager() const { return m_pToplevelIconManager; }
@@ -799,6 +813,9 @@ namespace gamescope
         void Wayland_WPColorManager_SupportedPrimariesNamed( wp_color_manager_v1 *pWPColorManager, uint32_t uPrimaries );
         void Wayland_WPColorManager_ColorManagerDone( wp_color_manager_v1 *pWPColorManager );
         static const wp_color_manager_v1_listener s_WPColorManagerListener;
+        void Wayland_ImageDescription_Failed( wp_image_description_v1 *pImageDescription, uint32_t uCause, const char *pszMessage );
+        void Wayland_ImageDescription_Ready( wp_image_description_v1 *pImageDescription, uint32_t uIdentity );
+        static const wp_image_description_v1_listener s_ImageDescriptionListener;
 
         void Wayland_DataSource_Send( struct wl_data_source *pSource, const char *pMime, int nFd );
         void Wayland_DataSource_Cancelled( struct wl_data_source *pSource );
@@ -826,6 +843,11 @@ namespace gamescope
         wp_presentation *m_pPresentation = nullptr;
         frog_color_management_factory_v1 *m_pFrogColorMgmtFactory = nullptr;
         wp_color_manager_v1 *m_pWPColorManager = nullptr;
+        wl_event_queue *m_pImageDescriptionQueue = nullptr;
+        wp_color_manager_v1 *m_pImageDescriptionFactory = nullptr;
+        enum class ImageDescriptionStatus { Pending, Ready, Failed };
+        wp_image_description_v1 *m_pAwaitedImageDescription = nullptr;
+        ImageDescriptionStatus m_eAwaitedImageDescriptionStatus = ImageDescriptionStatus::Pending;
         wp_image_description_v1 *m_pWPImageDescriptions[ GamescopeAppTextureColorspace_Count ]{};
         zwp_pointer_constraints_v1 *m_pPointerConstraints = nullptr;
         zwp_relative_pointer_manager_v1 *m_pRelativePointerManager = nullptr;
@@ -934,6 +956,11 @@ namespace gamescope
         .supported_tf_named        = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WPColorManager_SupportedTFNamed ),
         .supported_primaries_named = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WPColorManager_SupportedPrimariesNamed ),
         .done        = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_WPColorManager_ColorManagerDone ),
+    };
+    const wp_image_description_v1_listener CWaylandBackend::s_ImageDescriptionListener =
+    {
+        .failed = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_ImageDescription_Failed ),
+        .ready  = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_ImageDescription_Ready ),
     };
     const wl_data_source_listener CWaylandBackend::s_DataSourceListener =
     {
@@ -1516,11 +1543,11 @@ namespace gamescope
 
                     if ( oState->eColorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB )
                     {
-                        m_pCurrentImageDescription = wp_color_manager_v1_create_windows_scrgb( m_pBackend->GetWPColorManager() );
+                        m_pCurrentImageDescription = wp_color_manager_v1_create_windows_scrgb( m_pBackend->GetImageDescriptionFactory() );
                     }
                     else if ( oState->eColorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ )
                     {
-                        wp_image_description_creator_params_v1 *pParams = wp_color_manager_v1_create_parametric_creator( m_pBackend->GetWPColorManager() );
+                        wp_image_description_creator_params_v1 *pParams = wp_color_manager_v1_create_parametric_creator( m_pBackend->GetImageDescriptionFactory() );
 
                         if ( close_enough( flScale, 1.0f ) )
                         {
@@ -1565,6 +1592,12 @@ namespace gamescope
                                 pInfoframe->max_fall );
                         }
                         m_pCurrentImageDescription = wp_image_description_creator_params_v1_create( pParams );
+                    }
+
+                    if ( m_pCurrentImageDescription && !m_pBackend->WaitForImageDescription( m_pCurrentImageDescription ) )
+                    {
+                        wp_image_description_v1_destroy( m_pCurrentImageDescription );
+                        m_pCurrentImageDescription = nullptr;
                     }
                 }
 
@@ -1900,10 +1933,20 @@ namespace gamescope
         if ( m_pParent )
             return;
 
-        wp_image_description_v1 *pImageDescription = wp_color_management_surface_feedback_v1_get_preferred( m_pWPColorManagedSurfaceFeedback );
+        wp_color_management_surface_feedback_v1 *pFeedbackWrapper = (wp_color_management_surface_feedback_v1 *)wl_proxy_create_wrapper( m_pWPColorManagedSurfaceFeedback );
+        wl_proxy_set_queue( (wl_proxy *)pFeedbackWrapper, m_pBackend->GetImageDescriptionQueue() );
+        wp_image_description_v1 *pImageDescription = wp_color_management_surface_feedback_v1_get_preferred( pFeedbackWrapper );
+        wl_proxy_wrapper_destroy( pFeedbackWrapper );
+
+        if ( !m_pBackend->WaitForImageDescription( pImageDescription ) )
+        {
+            wp_image_description_v1_destroy( pImageDescription );
+            return;
+        }
+
         wp_image_description_info_v1 *pImageDescInfo = wp_image_description_v1_get_information( pImageDescription );
         wp_image_description_info_v1_add_listener( pImageDescInfo, &s_ImageDescriptionInfoListener, this );
-        wl_display_roundtrip( m_pBackend->GetDisplay() );
+        wl_display_roundtrip_queue( m_pBackend->GetDisplay(), m_pBackend->GetImageDescriptionQueue() );
 
         wp_image_description_info_v1_destroy( pImageDescInfo );
         wp_image_description_v1_destroy( pImageDescription );
@@ -2593,6 +2636,9 @@ namespace gamescope
         {
             m_pWPColorManager = (wp_color_manager_v1 *)wl_registry_bind( pRegistry, uName, &wp_color_manager_v1_interface, 1u );
             wp_color_manager_v1_add_listener( m_pWPColorManager, &s_WPColorManagerListener, this );
+            m_pImageDescriptionQueue = wl_display_create_queue( m_pDisplay );
+            m_pImageDescriptionFactory = (wp_color_manager_v1 *)wl_proxy_create_wrapper( m_pWPColorManager );
+            wl_proxy_set_queue( (wl_proxy *)m_pImageDescriptionFactory, m_pImageDescriptionQueue );
         }
         else if ( !strcmp( pInterface, zwp_pointer_constraints_v1_interface.name ) )
         {
@@ -2777,6 +2823,69 @@ namespace gamescope
     void CWaylandBackend::Wayland_WPColorManager_ColorManagerDone( wp_color_manager_v1 *pWPColorManager )
     {
 
+    }
+
+    // An image description may be used only once its ready event has arrived,
+    // and never after failed. Returns whether it is ready; the caller
+    // destroys one that is not.
+    bool CWaylandBackend::WaitForImageDescription( wp_image_description_v1 *pImageDescription )
+    {
+        m_pAwaitedImageDescription = pImageDescription;
+        m_eAwaitedImageDescriptionStatus = ImageDescriptionStatus::Pending;
+        wp_image_description_v1_add_listener( pImageDescription, &s_ImageDescriptionListener, this );
+
+        // Hosts answer at once. The bound keeps one that never does from
+        // holding the compositor thread.
+        const uint64_t ulDeadlineNanos = get_time_in_nanos() + 1'000'000'000ul;
+        while ( m_eAwaitedImageDescriptionStatus == ImageDescriptionStatus::Pending )
+        {
+            if ( wl_display_prepare_read_queue( m_pDisplay, m_pImageDescriptionQueue ) != 0 )
+            {
+                if ( wl_display_dispatch_queue_pending( m_pDisplay, m_pImageDescriptionQueue ) < 0 )
+                    break;
+                continue;
+            }
+
+            wl_display_flush( m_pDisplay );
+
+            const uint64_t ulNowNanos = get_time_in_nanos();
+            pollfd pollfd =
+            {
+                .fd     = wl_display_get_fd( m_pDisplay ),
+                .events = POLLIN,
+            };
+            const int nTimeoutMs = ulNowNanos < ulDeadlineNanos ? int( ( ulDeadlineNanos - ulNowNanos + 999'999ul ) / 1'000'000ul ) : 0;
+            const int nRet = poll( &pollfd, 1, nTimeoutMs );
+            if ( nRet <= 0 )
+            {
+                wl_display_cancel_read( m_pDisplay );
+                if ( nRet < 0 && ( errno == EINTR || errno == EAGAIN ) )
+                    continue;
+                break;
+            }
+
+            if ( wl_display_read_events( m_pDisplay ) < 0 )
+                break;
+            if ( wl_display_dispatch_queue_pending( m_pDisplay, m_pImageDescriptionQueue ) < 0 )
+                break;
+        }
+
+        m_pAwaitedImageDescription = nullptr;
+        if ( m_eAwaitedImageDescriptionStatus == ImageDescriptionStatus::Pending )
+            xdg_log.warnf( "The host did not make an image description ready." );
+        return m_eAwaitedImageDescriptionStatus == ImageDescriptionStatus::Ready;
+    }
+
+    void CWaylandBackend::Wayland_ImageDescription_Failed( wp_image_description_v1 *pImageDescription, uint32_t uCause, const char *pszMessage )
+    {
+        xdg_log.warnf( "The host failed an image description: %s (cause %u)", pszMessage, uCause );
+        if ( pImageDescription == m_pAwaitedImageDescription )
+            m_eAwaitedImageDescriptionStatus = ImageDescriptionStatus::Failed;
+    }
+    void CWaylandBackend::Wayland_ImageDescription_Ready( wp_image_description_v1 *pImageDescription, uint32_t uIdentity )
+    {
+        if ( pImageDescription == m_pAwaitedImageDescription )
+            m_eAwaitedImageDescriptionStatus = ImageDescriptionStatus::Ready;
     }
 
     // Data Source
