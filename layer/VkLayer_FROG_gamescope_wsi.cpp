@@ -1,7 +1,7 @@
 #define VK_USE_PLATFORM_WAYLAND_KHR
 #define VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_XLIB_KHR
-#include "vkroots.h"
+#include "gamescope-vkroots.h"
 #include "xcb_helpers.hpp"
 #include "vulkan_operators.hpp"
 #include "present_timing.hpp"

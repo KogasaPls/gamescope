@@ -1,4 +1,14 @@
-vkroots_dep = dependency('vkroots')
+vkroots_dep = declare_dependency(
+  dependencies: dependency('vkroots'),
+  include_directories: include_directories('.'),
+)
+configure_file(
+  input: 'vkroots-flagged-queues.diff',
+  output: 'gamescope-vkroots.h',
+  command: [find_program('backport-vkroots.sh'),
+            meson.project_source_root() / 'subprojects/vkroots/vkroots.h', '@INPUT@'],
+  capture: true,
+)
 if not cppc.compiles('''
   #include <vulkan/vulkan.h>
   #if !defined(VK_EXT_PRESENT_TIMING_SPEC_VERSION) || VK_EXT_PRESENT_TIMING_SPEC_VERSION < 3
