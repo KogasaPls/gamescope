@@ -2,6 +2,7 @@
 
 #include <X11/Xlib.h>
 
+#include <charconv>
 #include <cstdio>
 #include <format>
 #include <thread>
@@ -9,6 +10,7 @@
 #include <vector>
 #include <cstring>
 #include <string>
+#include <string_view>
 #if HAVE_LIBCAP
 #include <sys/capability.h>
 #endif
@@ -68,6 +70,10 @@ const struct option *gamescope_options = (struct option[]){
 	{ "filter", required_argument, nullptr, 'F' },
 	{ "output-width", required_argument, nullptr, 'W' },
 	{ "output-height", required_argument, nullptr, 'H' },
+#if HAVE_PIPEWIRE
+	{ "pipewire-capture-size", required_argument, nullptr, 0 },
+	{ "pipewire-capture-fps", required_argument, nullptr, 0 },
+#endif
 	{ "sharpness", required_argument, nullptr, 0 },
 	{ "fsr-sharpness", required_argument, nullptr, 0 },
 	{ "rt", no_argument, nullptr, 0 },
@@ -175,6 +181,10 @@ const char usage[] =
 	"  -w, --nested-width             game width\n"
 	"  -h, --nested-height            game height\n"
 	"  -r, --nested-refresh           game refresh rate (frames per second)\n"
+#if HAVE_PIPEWIRE
+	"  --pipewire-capture-size        maximum capture size (even WIDTHxHEIGHT)\n"
+	"  --pipewire-capture-fps         maximum capture frame rate\n"
+#endif
 	"  -m, --max-scale                maximum scale factor\n"
 	"  -S, --scaler                   upscaler type (auto, integer, fit, fill, stretch)\n"
 	"  -F, --filter                   upscaler filter (linear, nearest, fsr, nis, pixel, sgsr)\n"
@@ -471,6 +481,16 @@ static int parse_integer(const char *str, const char *optionName)
 	}
 }
 
+#if HAVE_PIPEWIRE
+static uint32_t parse_capture_limit( std::string_view value )
+{
+	uint32_t limit = 0;
+	const char *end = value.data() + value.size();
+	const auto result = std::from_chars( value.data(), end, limit );
+	return result.ec == std::errc{} && result.ptr == end ? limit : 0;
+}
+#endif
+
 static float parse_float(const char *str, const char *optionName)
 {
 	auto result = gamescope::Parse<float>(str);
@@ -733,6 +753,9 @@ int main(int argc, char **argv)
 	gamescope_optstring = optstring.c_str();
 
 	gamescope::GamescopeBackend eCurrentBackend = gamescope::GamescopeBackend::Auto;
+#if HAVE_PIPEWIRE
+	PipeWireCaptureLimits captureLimits{};
+#endif
 
 	int o;
 	int opt_index = -1;
@@ -801,6 +824,26 @@ int main(int argc, char **argv)
 				} else if (strcmp(opt_name, "version") == 0) {
 					gamescope::PrintVersion();
 					return 0;
+#if HAVE_PIPEWIRE
+				} else if (strcmp(opt_name, "pipewire-capture-size") == 0) {
+					const std::string_view size = optarg;
+					const auto split = size.find( 'x' );
+					const uint32_t width = parse_capture_limit( size.substr( 0, split ) );
+					const uint32_t height = split == std::string_view::npos
+						? 0 : parse_capture_limit( size.substr( split + 1 ) );
+					if ( !width || !height || width % 2 || height % 2 ) {
+						fprintf( stderr, "gamescope: --pipewire-capture-size requires positive even dimensions (WIDTHxHEIGHT)\n" );
+						return 1;
+					}
+					captureLimits.width = width;
+					captureLimits.height = height;
+				} else if (strcmp(opt_name, "pipewire-capture-fps") == 0) {
+					captureLimits.fps = parse_capture_limit( optarg );
+					if ( !captureLimits.fps ) {
+						fprintf( stderr, "gamescope: --pipewire-capture-fps requires a positive integer\n" );
+						return 1;
+					}
+#endif
 				} else if (strcmp(opt_name, "debug-layers") == 0) {
 					g_bDebugLayers = true;
 				} else if (strcmp(opt_name, "disable-color-management") == 0) {
@@ -1102,7 +1145,7 @@ int main(int argc, char **argv)
 		setenv("WAYLAND_DISPLAY", wlserver_get_wl_display_name(), 1);
 
 #if HAVE_PIPEWIRE
-	if ( !init_pipewire() )
+	if ( !init_pipewire( captureLimits ) )
 	{
 		fprintf( stderr, "Warning: failed to setup PipeWire, screen capture won't be available\n" );
 	}
