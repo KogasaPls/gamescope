@@ -8,6 +8,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -21,6 +23,14 @@ static LogScope pwr_log("pipewire");
 
 static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
 static int nudgePipe[2] = { -1, -1 };
+
+// The stream thread is started by init_pipewire() and stopped by
+// shutdown_pipewire(). s_bThreadRunning stays set until run_pipewire() has
+// torn the stream down.
+static std::atomic<bool> s_bThreadRunning;
+static std::atomic<bool> s_bQuit;
+static std::mutex s_ThreadExitLock;
+static std::condition_variable s_ThreadExitCond;
 
 // Pending buffer for PipeWire → steamcompmgr
 static std::atomic<struct pipewire_buffer *> out_buffer;
@@ -707,12 +717,17 @@ static void run_pipewire(struct pipewire_state *state)
 		},
 	};
 
-	while (true) {
+	// Tested before blocking too: dispatch_nudge() may have drained the nudge
+	// that shutdown_pipewire() wrote after setting the flag.
+	while (!s_bQuit) {
 		int ret = poll(pollfds, EVENT_COUNT, -1);
 		if (ret < 0) {
 			pwr_log.errorf_errno("poll failed");
 			break;
 		}
+
+		if (s_bQuit)
+			break;
 
 		if (pollfds[EVENT_PIPEWIRE].revents & POLLHUP) {
 			pwr_log.errorf("lost connection to server");
@@ -748,6 +763,12 @@ static void run_pipewire(struct pipewire_state *state)
 	pw_core_disconnect(state->core);
 	pw_context_destroy(state->context);
 	pw_loop_destroy(state->loop);
+
+	{
+		std::lock_guard<std::mutex> exitLock(s_ThreadExitLock);
+		s_bThreadRunning = false;
+	}
+	s_ThreadExitCond.notify_all();
 }
 
 bool init_pipewire(void)
@@ -809,6 +830,7 @@ bool init_pipewire(void)
 		return false;
 	}
 
+	s_bThreadRunning = true;
 	std::thread thread(run_pipewire, state);
 	thread.detach();
 
@@ -857,4 +879,17 @@ void nudge_pipewire(void)
 {
 	if (write(nudgePipe[1], "\n", 1) < 0)
 		pwr_log.errorf_errno("nudge_pipewire: write failed");
+}
+
+void shutdown_pipewire(void)
+{
+	std::unique_lock<std::mutex> lock(s_ThreadExitLock);
+	if (!s_bThreadRunning)
+		return;
+
+	s_bQuit = true;
+	nudge_pipewire();
+	// A thread stuck in PipeWire must not keep gamescope from exiting.
+	if (!s_ThreadExitCond.wait_for(lock, std::chrono::seconds(2), [] { return !s_bThreadRunning.load(); }))
+		pwr_log.errorf("the stream thread did not stop");
 }
