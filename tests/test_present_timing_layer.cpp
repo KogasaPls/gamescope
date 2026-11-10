@@ -1,7 +1,7 @@
 #define VK_USE_PLATFORM_WAYLAND_KHR
 #define VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_XLIB_KHR
-#include "vkroots.h"
+#include "gamescope-vkroots.h"
 
 // Exercise the actual layer and its loader interface with a fake driver.
 #include "../layer/VkLayer_FROG_gamescope_wsi.cpp"
