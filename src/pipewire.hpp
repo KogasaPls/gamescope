@@ -66,7 +66,13 @@ struct pipewire_buffer {
 	std::atomic<bool> copying;
 };
 
-bool init_pipewire(void);
+struct PipeWireCaptureLimits {
+	uint32_t width;
+	uint32_t height;
+	uint32_t fps;
+};
+
+bool init_pipewire(PipeWireCaptureLimits limits);
 void shutdown_pipewire(void);
 uint32_t get_pipewire_stream_node_id(void);
 struct pipewire_buffer *dequeue_pipewire_buffer(void);
