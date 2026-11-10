@@ -8093,6 +8093,11 @@ steamcompmgr_exit(void)
 
 	vulkan_present_wait_shutdown();
 
+#if HAVE_PIPEWIRE
+	// The stream thread makes textures and asks the backend about them.
+	shutdown_pipewire();
+#endif
+
     gamescope::IBackend::Set( nullptr );
 
     wlserver_lock();
