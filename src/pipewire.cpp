@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -23,6 +24,8 @@ static LogScope pwr_log("pipewire");
 
 static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
 static int nudgePipe[2] = { -1, -1 };
+// Set before starting the PipeWire thread.
+static PipeWireCaptureLimits s_CaptureLimits{};
 
 // The stream thread is started by init_pipewire() and stopped by
 // shutdown_pipewire(). s_bThreadRunning stays set until run_pipewire() has
@@ -101,17 +104,26 @@ static void calculate_capture_size()
 	s_nCaptureWidth = s_nOutputWidth;
 	s_nCaptureHeight = s_nOutputHeight;
 
-	if (s_nRequestedWidth > 0 && s_nRequestedHeight > 0 &&
-	    (s_nOutputWidth > s_nRequestedWidth || s_nOutputHeight > s_nRequestedHeight)) {
-		// Need to clamp to the smallest dimension
-		float flRatioW = static_cast<float>(s_nRequestedWidth) / s_nOutputWidth;
-		float flRatioH = static_cast<float>(s_nRequestedHeight) / s_nOutputHeight;
+	uint32_t maxWidth = s_nOutputWidth;
+	uint32_t maxHeight = s_nOutputHeight;
+	if (s_CaptureLimits.width && s_CaptureLimits.height) {
+		maxWidth = std::min(maxWidth, s_CaptureLimits.width);
+		maxHeight = std::min(maxHeight, s_CaptureLimits.height);
+	}
+	if (s_nRequestedWidth && s_nRequestedHeight) {
+		maxWidth = std::min(maxWidth, s_nRequestedWidth);
+		maxHeight = std::min(maxHeight, s_nRequestedHeight);
+	}
+
+	if (s_nOutputWidth && s_nOutputHeight && (s_nOutputWidth > maxWidth || s_nOutputHeight > maxHeight)) {
+		float flRatioW = static_cast<float>(maxWidth) / s_nOutputWidth;
+		float flRatioH = static_cast<float>(maxHeight) / s_nOutputHeight;
 		if (flRatioW <= flRatioH) {
-			s_nCaptureWidth = s_nRequestedWidth;
-			s_nCaptureHeight = static_cast<uint32_t>(ceilf(flRatioW * s_nOutputHeight));
+			s_nCaptureWidth = maxWidth;
+			s_nCaptureHeight = std::min(maxHeight, static_cast<uint32_t>(ceilf(flRatioW * s_nOutputHeight)));
 		} else {
-			s_nCaptureWidth = static_cast<uint32_t>(ceilf(flRatioH * s_nOutputWidth));
-			s_nCaptureHeight = s_nRequestedHeight;
+			s_nCaptureWidth = std::min(maxWidth, static_cast<uint32_t>(ceilf(flRatioH * s_nOutputWidth)));
+			s_nCaptureHeight = maxHeight;
 		}
 	}
 
@@ -128,62 +140,46 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
 	struct spa_fraction framerate = SPA_FRACTION(0, 1);
 	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
 
-	struct spa_pod_frame obj_frame, choice_frame;
-	spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
-	spa_pod_builder_add(builder,
-		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
-		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-		SPA_FORMAT_VIDEO_format, SPA_POD_Id(format),
-		SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
-		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerate),
-		SPA_FORMAT_VIDEO_requested_size, SPA_POD_CHOICE_RANGE_Rectangle( &min_requested_size, &min_requested_size, &max_requested_size ),
-		SPA_FORMAT_VIDEO_gamescope_focus_appid, SPA_POD_CHOICE_RANGE_Long( 0ll, INT64_MIN, INT64_MAX ),
-		0);
-	if (format == SPA_VIDEO_FORMAT_NV12) {
+	for (bool dmabuf : { true, false }) {
+		struct spa_pod_frame obj_frame;
+		spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
 		spa_pod_builder_add(builder,
-			SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_COLOR_MATRIX_BT601,
-							SPA_VIDEO_COLOR_MATRIX_BT601,
-							SPA_VIDEO_COLOR_MATRIX_BT709),
-			SPA_FORMAT_VIDEO_colorRange, SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_COLOR_RANGE_16_235,
-							SPA_VIDEO_COLOR_RANGE_16_235,
-							SPA_VIDEO_COLOR_RANGE_0_255),
+			SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+			SPA_FORMAT_VIDEO_format, SPA_POD_Id(format),
+			SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
+			SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerate),
+			SPA_FORMAT_VIDEO_requested_size, SPA_POD_CHOICE_RANGE_Rectangle( &min_requested_size, &min_requested_size, &max_requested_size ),
+			SPA_FORMAT_VIDEO_gamescope_focus_appid, SPA_POD_CHOICE_RANGE_Long( 0ll, INT64_MIN, INT64_MAX ),
 			0);
+		if (s_CaptureLimits.fps) {
+			const spa_fraction maxFramerate = SPA_FRACTION(s_CaptureLimits.fps, 1);
+			spa_pod_builder_add(builder,
+				SPA_FORMAT_VIDEO_maxFramerate, SPA_POD_CHOICE_RANGE_Fraction(&maxFramerate, &framerate, &maxFramerate),
+				0);
+		}
+		if (format == SPA_VIDEO_FORMAT_NV12) {
+			spa_pod_builder_add(builder,
+				SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_CHOICE_ENUM_Id(3,
+								SPA_VIDEO_COLOR_MATRIX_BT601,
+								SPA_VIDEO_COLOR_MATRIX_BT601,
+								SPA_VIDEO_COLOR_MATRIX_BT709),
+				SPA_FORMAT_VIDEO_colorRange, SPA_POD_CHOICE_ENUM_Id(3,
+								SPA_VIDEO_COLOR_RANGE_16_235,
+								SPA_VIDEO_COLOR_RANGE_16_235,
+								SPA_VIDEO_COLOR_RANGE_0_255),
+				0);
+		}
+		if (dmabuf) {
+			struct spa_pod_frame choice_frame;
+			spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+			spa_pod_builder_push_choice(builder, &choice_frame, SPA_CHOICE_Enum, 0);
+			spa_pod_builder_long(builder, modifier); // default
+			spa_pod_builder_long(builder, modifier);
+			spa_pod_builder_pop(builder, &choice_frame);
+		}
+		params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
 	}
-	spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
-	spa_pod_builder_push_choice(builder, &choice_frame, SPA_CHOICE_Enum, 0);
-	spa_pod_builder_long(builder, modifier); // default
-	spa_pod_builder_long(builder, modifier);
-	spa_pod_builder_pop(builder, &choice_frame);
-	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
-
-	spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
-	spa_pod_builder_add(builder,
-		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
-		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-		SPA_FORMAT_VIDEO_format, SPA_POD_Id(format),
-		SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
-		SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerate),
-		SPA_FORMAT_VIDEO_requested_size, SPA_POD_CHOICE_RANGE_Rectangle( &min_requested_size, &min_requested_size, &max_requested_size ),
-		SPA_FORMAT_VIDEO_gamescope_focus_appid, SPA_POD_CHOICE_RANGE_Long( 0ll, INT64_MIN, INT64_MAX ),
-		0);
-	if (format == SPA_VIDEO_FORMAT_NV12) {
-		spa_pod_builder_add(builder,
-			SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_COLOR_MATRIX_BT601,
-							SPA_VIDEO_COLOR_MATRIX_BT601,
-							SPA_VIDEO_COLOR_MATRIX_BT709),
-			SPA_FORMAT_VIDEO_colorRange, SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_COLOR_RANGE_16_235,
-							SPA_VIDEO_COLOR_RANGE_16_235,
-							SPA_VIDEO_COLOR_RANGE_0_255),
-			0);
-	}
-	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
-
-//	for (auto& param : params)
-//		spa_debug_format(2, nullptr, param);
 }
 
 
@@ -417,8 +413,9 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	// of framerate. Respect it independently of the compositor refresh.
 	const auto &rate = state->video_info.framerate.num
 		? state->video_info.framerate : state->video_info.max_framerate;
-	state->capture_interval_nanos.store(
-		gamescope::pipewire_capture::Interval(rate.num, rate.denom));
+	state->capture_interval_nanos.store(std::max(
+		gamescope::pipewire_capture::Interval(rate.num, rate.denom),
+		gamescope::pipewire_capture::Interval(s_CaptureLimits.fps, 1)));
 
 	int bpp = 4;
 	if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
@@ -681,7 +678,8 @@ static bool connect_stream(struct pipewire_state *state)
 	s_nRequestedHeight = 0;
 	get_capture_source_size(s_nOutputWidth, s_nOutputHeight);
 	calculate_capture_size();
-	state->capture_interval_nanos.store(0);
+	state->capture_interval_nanos.store(
+		gamescope::pipewire_capture::Interval(s_CaptureLimits.fps, 1));
 
 	uint8_t buf[4096];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
@@ -790,8 +788,9 @@ static void run_pipewire(struct pipewire_state *state)
 	s_ThreadExitCond.notify_all();
 }
 
-bool init_pipewire(void)
+bool init_pipewire(PipeWireCaptureLimits limits)
 {
+	s_CaptureLimits = limits;
 	struct pipewire_state *state = &pipewire_state;
 
 	pw_init(nullptr, nullptr);
