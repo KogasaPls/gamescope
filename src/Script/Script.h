@@ -56,6 +56,7 @@ namespace gamescope
         }
 
         void RunDefaultScripts();
+        void ApplyConVarEnvironment( const char *const *environment );
 
         void RunScriptText( std::string_view svContents );
 

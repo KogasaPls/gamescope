@@ -18,6 +18,7 @@
 #include "pipewire.hpp"
 #include "pipewire_capture_size.hpp"
 #include "log.hpp"
+#include "pipewire_device_local.hpp"
 
 #include <spa/debug/format.h>
 
@@ -563,7 +564,7 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 
 	buffer->texture = new CVulkanTexture();
 	CVulkanTexture::createFlags screenshotImageFlags;
-	screenshotImageFlags.bMappable = true;
+	screenshotImageFlags.bMappable = !(is_dmabuf && gamescope::pipewire_capture::cv_device_local.Get());
 	screenshotImageFlags.bTransferDst = true;
 	screenshotImageFlags.bStorage = true;
 	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12)
@@ -572,6 +573,12 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 		screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
 	}
 	bool bImageInitSuccess = buffer->texture->BInit( s_nCaptureWidth, s_nCaptureHeight, 1u, drmFormat, screenshotImageFlags );
+	if (!bImageInitSuccess && !screenshotImageFlags.bMappable) {
+		pwr_log.warnf("Device-local PipeWire texture failed, falling back to host-visible memory");
+		screenshotImageFlags.bMappable = true;
+		buffer->texture = new CVulkanTexture();
+		bImageInitSuccess = buffer->texture->BInit( s_nCaptureWidth, s_nCaptureHeight, 1u, drmFormat, screenshotImageFlags );
+	}
 	if ( !bImageInitSuccess )
 	{
 		pwr_log.errorf("Failed to initialize pipewire texture");
