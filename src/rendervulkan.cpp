@@ -2409,18 +2409,23 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	VkMemoryRequirements memRequirements;
 	g_device.vk.GetImageMemoryRequirements(g_device.device(), m_vkImage, &memRequirements);
 
-	VkMemoryAllocateInfo allocInfo = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		.allocationSize = memRequirements.size,
-		.memoryTypeIndex = uint32_t(g_device.findMemoryType(properties, memRequirements.memoryTypeBits)),
-	};
-
-	m_size = allocInfo.allocationSize;
-
+	m_size = memRequirements.size;
 	VkDeviceMemory memoryHandle = VK_NULL_HANDLE;
 
 	if ( pExistingImageToReuseMemory == nullptr )
 	{
+		const int32_t memoryTypeIndex = g_device.findMemoryType(properties, memRequirements.memoryTypeBits);
+		if (memoryTypeIndex < 0) {
+			vk_log.errorf("No compatible memory type for Vulkan texture");
+			return false;
+		}
+
+		VkMemoryAllocateInfo allocInfo = {
+			.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+			.allocationSize = m_size,
+			.memoryTypeIndex = uint32_t(memoryTypeIndex),
+		};
+
 		// Possible pNexts
 		VkImportMemoryFdInfoKHR importMemoryInfo = {};
 		VkExportMemoryAllocateInfo memory_export_info = {};
