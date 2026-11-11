@@ -64,6 +64,8 @@ struct pipewire_buffer {
 	// We pass the buffer to the steamcompmgr thread for copying. This is set
 	// to true if the buffer is currently owned by the steamcompmgr thread.
 	std::atomic<bool> copying;
+	// Written by steamcompmgr before handing a submitted buffer to PipeWire.
+	uint64_t capture_sequence = 0;
 };
 
 struct PipeWireCaptureLimits {
@@ -79,6 +81,6 @@ struct pipewire_buffer *dequeue_pipewire_buffer(void);
 bool pipewire_is_streaming();
 bool pipewire_capture_frame_due(int nRefreshmHz);
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer);
-void push_pipewire_buffer(struct pipewire_buffer *buffer);
+void push_pipewire_buffer(struct pipewire_buffer *buffer, uint64_t sequence);
 void nudge_pipewire(void);
 void pipewire_set_capture_crop_size(uint32_t uWidth, uint32_t uHeight);

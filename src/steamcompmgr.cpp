@@ -3185,9 +3185,7 @@ static void paint_pipewire()
 
 	if ( oPipewireSequence )
 	{
-		vulkan_wait( *oPipewireSequence, true );
-
-		push_pipewire_buffer( s_pPipewireBuffer );
+		push_pipewire_buffer( s_pPipewireBuffer, *oPipewireSequence );
 		s_pPipewireBuffer = nullptr;
 	}
 }

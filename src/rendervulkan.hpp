@@ -484,6 +484,7 @@ void vulkan_present_to_window( void );
 void vulkan_present_wait_shutdown( void );
 
 void vulkan_garbage_collect( void );
+bool vulkan_poll_sequence( uint64_t sequence );
 bool vulkan_remake_swapchain( void );
 bool vulkan_remake_output_images( void );
 bool acquire_next_image( void );
@@ -850,6 +851,7 @@ public:
 	std::unique_ptr<CVulkanCmdBuffer> commandBuffer();
 	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
 	uint64_t submitInternal( CVulkanCmdBuffer* cmdBuf );
+	VkResult waitForSequence(uint64_t sequence, uint64_t timeout);
 	void wait(uint64_t sequence, bool reset = true);
 	void waitIdle(bool reset = true);
 	void garbageCollect();
