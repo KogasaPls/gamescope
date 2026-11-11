@@ -1562,11 +1562,8 @@ void CVulkanCmdBuffer::AddReleasePoint( std::shared_ptr<gamescope::CReleaseTimel
 	m_releasePoints.emplace_back( std::move( pReleasePoint ) );
 }
 
-void CVulkanDevice::wait(uint64_t sequence, bool reset)
+VkResult CVulkanDevice::waitForSequence(uint64_t sequence, uint64_t timeout)
 {
-	if (m_submissionSeqNo == sequence)
-		m_uploadBufferOffset = 0;
-
 	VkSemaphoreWaitInfo waitInfo = {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
 		.semaphoreCount = 1,
@@ -1574,7 +1571,15 @@ void CVulkanDevice::wait(uint64_t sequence, bool reset)
 		.pValues = &sequence,
 	} ;
 
-	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
+	return vk.WaitSemaphores( device(), &waitInfo, timeout );
+}
+
+void CVulkanDevice::wait(uint64_t sequence, bool reset)
+{
+	if (m_submissionSeqNo == sequence)
+		m_uploadBufferOffset = 0;
+
+	vk_check( waitForSequence(sequence, UINT64_MAX) );
 
 	if (reset)
 		resetCmdBuffers(sequence);
@@ -4715,6 +4720,18 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 void vulkan_wait( uint64_t ulSeqNo, bool bReset )
 {
 	return g_device.wait( ulSeqNo, bReset );
+}
+
+bool vulkan_poll_sequence( uint64_t sequence )
+{
+	// Keep the host semaphore wait for mapped captures. Command-buffer
+	// recycling remains on the compositor thread.
+	const VkResult result = g_device.waitForSequence( sequence, 0 );
+	if ( result == VK_TIMEOUT )
+		return false;
+
+	vk_check( result );
+	return true;
 }
 
 bool vulkan_has_drm_props()

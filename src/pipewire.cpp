@@ -39,7 +39,7 @@ static std::condition_variable s_ThreadExitCond;
 
 // Pending buffer for PipeWire → steamcompmgr
 static std::atomic<struct pipewire_buffer *> out_buffer;
-// Pending buffer for steamcompmgr → PipeWire
+// The single submitted buffer owned by the PipeWire thread until it queues it.
 static std::atomic<struct pipewire_buffer *> in_buffer;
 
 // Requested capture size
@@ -322,25 +322,25 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
 			pwr_log.errorf("pw_stream_update_params failed");
 		}
 	}
+}
 
-	struct pipewire_buffer *buffer = in_buffer.exchange(nullptr);
-	if (buffer != nullptr) {
-		// We now completely own the buffer, it's no longer shared with the
-		// steamcompmgr thread.
+static void queue_completed_buffer(struct pipewire_state *state)
+{
+	struct pipewire_buffer *buffer = in_buffer.load();
+	if (!buffer || !vulkan_poll_sequence(buffer->capture_sequence))
+		return;
 
-		buffer->copying = false;
-
-		if (buffer->buffer != nullptr) {
-			copy_buffer(state, buffer);
-
-			int ret = pw_stream_queue_buffer(state->stream, buffer->buffer);
-			if (ret < 0) {
-				pwr_log.errorf("pw_stream_queue_buffer failed");
-			}
-		} else {
-			destroy_buffer(buffer);
-		}
+	// This is the only thread that removes a submitted buffer while running.
+	in_buffer.store(nullptr);
+	buffer->copying = false;
+	if (buffer->buffer == nullptr) {
+		destroy_buffer(buffer);
+		return;
 	}
+
+	copy_buffer(state, buffer);
+	if (pw_stream_queue_buffer(state->stream, buffer->buffer) < 0)
+		pwr_log.errorf("pw_stream_queue_buffer failed");
 }
 
 static void stream_handle_state_changed(void *data, enum pw_stream_state old_stream_state, enum pw_stream_state stream_state, const char *error)
@@ -750,7 +750,10 @@ static void run_pipewire(struct pipewire_state *state)
 	// Tested before blocking too: dispatch_nudge() may have drained the nudge
 	// that shutdown_pipewire() wrote after setting the flag.
 	while (!s_bQuit) {
-		int ret = poll(pollfds, EVENT_COUNT, -1);
+		// A pending capture has no pollable GPU fence. Check its timeline
+		// without delaying PipeWire events or waking the display loop.
+		const int timeout = in_buffer.load() ? 2 : -1;
+		int ret = poll(pollfds, EVENT_COUNT, timeout);
 		if (ret < 0) {
 			pwr_log.errorf_errno("poll failed");
 			break;
@@ -784,6 +787,8 @@ static void run_pipewire(struct pipewire_state *state)
 		if (state->needs_reconnect && !reconnect_stream(state)) {
 			break;
 		}
+
+		queue_completed_buffer(state);
 	}
 
 	pwr_log.infof("exiting");
@@ -797,6 +802,10 @@ static void run_pipewire(struct pipewire_state *state)
 	{
 		std::lock_guard<std::mutex> exitLock(s_ThreadExitLock);
 		s_bThreadRunning = false;
+		// pw_stream_destroy has detached the buffer. The GPU command keeps
+		// its own texture reference until compositor garbage collection.
+		if (auto *buffer = in_buffer.exchange(nullptr))
+			destroy_buffer(buffer);
 	}
 	s_ThreadExitCond.notify_all();
 }
@@ -899,6 +908,9 @@ bool pipewire_is_streaming()
 
 bool pipewire_capture_frame_due(int nRefreshmHz)
 {
+	if (in_buffer.load())
+		return false;
+
 	const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count();
 	const uint64_t refreshPeriod = nRefreshmHz > 0 ? 1'000'000'000'000ull / nRefreshmHz : 0;
@@ -914,14 +926,20 @@ struct pipewire_buffer *dequeue_pipewire_buffer(void)
 	return out_buffer.exchange(nullptr);
 }
 
-void push_pipewire_buffer(struct pipewire_buffer *buffer)
+void push_pipewire_buffer(struct pipewire_buffer *buffer, uint64_t sequence)
 {
-	struct pipewire_buffer *old = in_buffer.exchange(buffer);
-	if ( old != nullptr )
-	{
-		pwr_log.errorf_errno("push_pipewire_buffer: Already had a buffer?!");
+	buffer->capture_sequence = sequence;
+	// steamcompmgr is the sole producer and only paints with an empty slot.
+	[[maybe_unused]] auto *old = in_buffer.exchange(buffer);
+	assert(old == nullptr);
+
+	if (s_bThreadRunning) {
+		nudge_pipewire();
+	} else if (in_buffer.compare_exchange_strong(buffer, nullptr)) {
+		// Publication raced stream destruction, and the worker did not
+		// take this buffer in its exit cleanup.
+		destroy_buffer(buffer);
 	}
-	nudge_pipewire();
 }
 
 void nudge_pipewire(void)
