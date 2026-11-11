@@ -1077,30 +1077,7 @@ int main(int argc, char **argv)
 		gamescope::CScriptScopedLock script;
 		script.Manager().RunDefaultScripts();
 
-		// Allow overriding the value of any ConVar with a suitably named environment variable
-		// (gamescope_ConVar_name=override_value). This takes precedence over the ConVar's
-		// default value and over values assigned by default scripts.
-		char **s = environ;
-		const char *prefix = "gamescope_";
-		size_t prefix_len = strlen( prefix );
-		for ( ; *s; s++ )
-		{
-			char *envvar = strdup( *s );
-			if ( strncmp( envvar, prefix, prefix_len ) == 0 ) {
-				std::string_view name( strtok( envvar, "=" ) + prefix_len );
-				if ( ! name.empty() )
-				{
-					std::string_view value( strtok( nullptr, "=" ) );
-					if ( script.Manager().Gamescope().Convars.Base[name].valid() )
-					{
-						auto override_script = std::format( "gamescope.convars.{}.value = {}", name, value );
-						console_log.infof( "Overriding from environment variable: %s", override_script.c_str() );
-						script->script( override_script );
-					}
-				}
-			}
-			free( envvar );
-		}
+		script.Manager().ApplyConVarEnvironment( environ );
 	}
 
 	XInitThreads();

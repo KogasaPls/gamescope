@@ -6,6 +6,7 @@
 #include "Utils/String.h"
 
 #include <filesystem>
+#include <format>
 #include <algorithm>
 
 namespace gamescope
@@ -134,6 +135,30 @@ namespace gamescope
         {
             std::string sUserConfigs = std::string{ GetConfigDir() } + "/gamescope/scripts";
             RunFolder( sUserConfigs, true );
+        }
+    }
+
+    void CScriptManager::ApplyConVarEnvironment( const char *const *environment )
+    {
+        constexpr std::string_view prefix = "gamescope_";
+        for ( ; *environment; ++environment )
+        {
+            std::string_view entry{ *environment };
+            if ( !entry.starts_with( prefix ) )
+                continue;
+
+            entry.remove_prefix( prefix.size() );
+            const auto separator = entry.find( '=' );
+            if ( separator == std::string_view::npos || separator == 0 || separator + 1 == entry.size() )
+                continue;
+
+            const auto name = entry.substr( 0, separator );
+            if ( !Gamescope().Convars.Base[name].valid() )
+                continue;
+
+            const auto script = std::format( "gamescope.convars.{}.value = {}", name, entry.substr( separator + 1 ) );
+            console_log.infof( "Overriding from environment variable: %s", script.c_str() );
+            State().script( script );
         }
     }
 

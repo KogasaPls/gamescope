@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -78,11 +79,11 @@ namespace gamescope
     };
 
 
-    template <typename T>
+    template <typename T, bool bAtomic = false>
     class ConVar : public ConCommand
     {
         friend struct detail::ConVarScriptRegistrar;
-        using ConVarCallbackFunc = std::function<void(ConVar<T> &)>;
+        using ConVarCallbackFunc = std::function<void(ConVar &)>;
     public:
         ConVar( std::string_view pszName, T defaultValue = T{}, std::string_view pszDescription = "", ConVarCallbackFunc func = nullptr, bool bRunCallbackAtStartup = false, bool bRegisterScript = true )
             : ConCommand( pszName, pszDescription, [this]( std::span<std::string_view> pArgs ){ this->InvokeFunc( pArgs ); }, false )
@@ -101,12 +102,15 @@ namespace gamescope
         }
 
 #if HAVE_SCRIPTING
-        static void RegisterScript( std::string_view name, ConVar<T> *cv );
+        static void RegisterScript( std::string_view name, ConVar *cv );
 #endif
 
-        const T& Get() const
+        decltype(auto) Get() const
         {
-            return m_Value;
+            if constexpr ( bAtomic )
+                return m_Value.load( std::memory_order_relaxed );
+            else
+                return ( m_Value );
         }
 
         template <typename J>
@@ -128,7 +132,7 @@ namespace gamescope
         }
 
         template <typename J>
-        ConVar<T>& operator =( const J &newValue ) { SetValue<J>( newValue ); return *this; }
+        ConVar& operator =( const J &newValue ) { SetValue<J>( newValue ); return *this; }
 
         operator T() const { return m_Value; }
 
@@ -154,7 +158,7 @@ namespace gamescope
             {
                 // We should move to std format for logging and stuff.
                 // This is kinda gross and grody!
-                std::string sValue = ToString( m_Value );
+                std::string sValue = ToString( Get() );
                 console_log.infof( "%.*s: %.*s\n%.*s",
                     (int)m_pszName.length(), m_pszName.data(),
                     (int)sValue.length(), sValue.data(),
@@ -183,10 +187,11 @@ namespace gamescope
             }
         }
     private:
-        T m_Value{};
+        std::conditional_t<bAtomic, std::atomic<T>, T> m_Value{};
         ConVarCallbackFunc m_Callback;
-        bool m_bInCallback;
+        bool m_bInCallback = false;
     };
 
-
+    template <typename T>
+    using AtomicConVar = ConVar<T, true>;
 }
