@@ -54,3 +54,26 @@ TEST_CASE("ConVar", "[convar]") {
 		REQUIRE(cv_bool_var.Get() == true);
 	}
 }
+
+#if HAVE_PIPEWIRE
+#include "pipewire_device_local.hpp"
+
+TEST_CASE("PipeWire allocation sees Lua, environment and console settings", "[convar]") {
+    auto &deviceLocal = pipewire_capture::cv_device_local;
+    CScriptScopedLock script;
+    script.Manager().RunScriptText("gamescope.convars.pipewire_device_local.value = true");
+    REQUIRE(deviceLocal.Get());
+
+    const char *environment[] = {"gamescope_pipewire_device_local=0", nullptr};
+    script.Manager().ApplyConVarEnvironment(environment);
+    REQUIRE_FALSE(deviceLocal.Get());
+    environment[0] = "gamescope_pipewire_device_local=1";
+    script.Manager().ApplyConVarEnvironment(environment);
+    REQUIRE(deviceLocal.Get());
+
+    std::string_view args[] = {"pipewire_device_local", "false"};
+    REQUIRE(ConCommand::Exec(args));
+    REQUIRE_FALSE(deviceLocal.Get());
+    REQUIRE_FALSE(script->script("return gamescope.convars.pipewire_device_local.value").get<bool>());
+}
+#endif
