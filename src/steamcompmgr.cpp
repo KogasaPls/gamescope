@@ -3098,6 +3098,14 @@ static void paint_pipewire( uint64_t ulFocusAppId, global_focus_t *pFocus, std::
 	uint32_t uWidth = s_pPipewireBuffer->texture->width();
 	uint32_t uHeight = s_pPipewireBuffer->texture->height();
 
+	gamescope::Rc<CVulkanTexture> pRGBTexture = s_pPipewireBuffer->texture->isYcbcr()
+		? vulkan_acquire_capture_texture( uWidth, uHeight, false, vulkan_get_rgb10_capture_format() )
+		: gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->texture };
+	if ( !pRGBTexture )
+		return; // Keep the buffer and retry when an RGB scratch texture is available.
+
+	gamescope::Rc<CVulkanTexture> pYUVTexture = s_pPipewireBuffer->texture->isYcbcr() ? s_pPipewireBuffer->texture : nullptr;
+
 	const uint32_t uCompositeDebugBackup = g_uCompositeDebug;
 	const uint32_t uBackupWidth = currentOutputWidth;
 	const uint32_t uBackupHeight = currentOutputHeight;
@@ -3164,13 +3172,6 @@ static void paint_pipewire( uint64_t ulFocusAppId, global_focus_t *pFocus, std::
 		currentOutputHeight = uHeight;
 	}
 
-	gamescope::Rc<CVulkanTexture> pRGBTexture = s_pPipewireBuffer->texture->isYcbcr()
-		? vulkan_acquire_capture_texture( uWidth, uHeight, false, vulkan_get_rgb10_capture_format() )
-		: gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->texture };
-
-	gamescope::Rc<CVulkanTexture> pYUVTexture = s_pPipewireBuffer->texture->isYcbcr() ? s_pPipewireBuffer->texture : nullptr;
-
-
 	std::optional<uint64_t> oPipewireSequence = vulkan_screenshot( &frameInfo, pRGBTexture, pYUVTexture );
 	// If we ever want the fat compositing path, use this.
 	//std::optional<uint64_t> oPipewireSequence = vulkan_composite( &frameInfo, s_pPipewireBuffer->texture, false, pRGBTexture, false );
@@ -3182,9 +3183,7 @@ static void paint_pipewire( uint64_t ulFocusAppId, global_focus_t *pFocus, std::
 
 	if ( oPipewireSequence )
 	{
-		vulkan_wait( *oPipewireSequence, true );
-
-		push_pipewire_buffer( s_pPipewireBuffer );
+		push_pipewire_buffer( s_pPipewireBuffer, *oPipewireSequence );
 		s_pPipewireBuffer = nullptr;
 		lastSubmittedFrame = captureFrame;
 	}
