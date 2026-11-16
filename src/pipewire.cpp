@@ -96,6 +96,11 @@ static void destroy_buffer(struct pipewire_buffer *buffer) {
 	delete buffer;
 }
 
+void pipewire_invalidate_capture()
+{
+	++pipewire_state.capture_generation;
+}
+
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer)
 {
 	destroy_buffer(buffer);

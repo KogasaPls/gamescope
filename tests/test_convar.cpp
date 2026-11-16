@@ -2,6 +2,7 @@
 
 #include "convar.h"
 #include "Script/Script.h"
+#include "capture_tonemap_settings.hpp"
 
 using namespace gamescope;
 
@@ -77,3 +78,30 @@ TEST_CASE("PipeWire allocation sees Lua, environment and console settings", "[co
     REQUIRE_FALSE(script->script("return gamescope.convars.pipewire_device_local.value").get<bool>());
 }
 #endif
+
+TEST_CASE("HDR capture LUT settings follow Lua, environment and console writes", "[convar]") {
+    CScriptScopedLock script;
+    script.Manager().RunScriptText(R"(
+        gamescope.convars.capture_sdr_white_nits.value = 203
+        gamescope.convars.capture_hdr_peak_nits.value = 1000
+        gamescope.convars.capture_tonemap_operator.value = 2
+    )");
+    REQUIRE(capture_tonemap::CurrentSettings() == capture_tonemap::Resolve(203.f, 1000.f, 2));
+
+    const char *environment[] = {
+        "gamescope_capture_sdr_white_nits=180",
+        "gamescope_capture_hdr_peak_nits=800",
+        "gamescope_capture_tonemap_operator=1",
+        nullptr
+    };
+    script.Manager().ApplyConVarEnvironment(environment);
+    REQUIRE(capture_tonemap::CurrentSettings() == capture_tonemap::Resolve(180.f, 800.f, 1));
+
+    std::string_view white[] = {"capture_sdr_white_nits", "500"};
+    std::string_view peak[] = {"capture_hdr_peak_nits", "0"};
+    std::string_view op[] = {"capture_tonemap_operator", "3"};
+    REQUIRE(ConCommand::Exec(white));
+    REQUIRE(ConCommand::Exec(peak));
+    REQUIRE(ConCommand::Exec(op));
+    REQUIRE(capture_tonemap::CurrentSettings() == capture_tonemap::CaptureTonemap{});
+}

@@ -2,6 +2,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "color_helpers_impl.h"
+#include "capture_tonemap.hpp"
 
 namespace
 {
@@ -50,5 +51,39 @@ TEST_CASE( "SDR saturation targets the panel primaries in an HDR container", "[c
 		CAPTURE( sample.r, sample.g, sample.b );
 		const auto &encoded = lut.data[sample.r + edge * ( sample.g + edge * sample.b )];
 		RequireColor( pq_to_nits( encoded ), sample.nits, 0.02f );
+	}
+}
+
+TEST_CASE( "Neutral HDR capture samples clip or roll off into SDR white", "[color_helpers]" )
+{
+	const bool rollOff = GENERATE( false, true );
+	const auto capture = gamescope::capture_tonemap::Resolve( 200.f, rollOff ? 1000.f : 0.f, 3 );
+	tonemapping_t mapping;
+	mapping.g22_luminance = capture.flSDRWhiteNits;
+	if ( capture.bRollOff )
+	{
+		mapping.eOperator = static_cast<ETonemapOperator>( capture.nOperator );
+		mapping.eetf2390.init( { 0.f, capture.flSourcePeakNits }, { 0.f, capture.flSDRWhiteNits } );
+	}
+
+	lut1d_t shaper;
+	calcColorTransform<rendervulkan::s_nLutEdgeSize3d>( &shaper, rendervulkan::s_nLutSize1d, nullptr,
+		displaycolorimetry_2020, EOTF_PQ, displaycolorimetry_709, EOTF_Gamma22, displaycolorimetry_709,
+		{}, k_EChromaticAdapatationMethod_XYZ, {}, {}, mapping, nullptr, 1.f );
+
+	auto gray = [&]( float nits ) {
+		return shaper.dataR[std::lround( nits_to_pq( nits ) * ( shaper.lutSize - 1 ) )];
+	};
+	REQUIRE( gray( 0.f ) < 0.001f );
+	REQUIRE( gray( 1000.f ) > 0.995f );
+	if ( rollOff )
+	{
+		REQUIRE( gray( 200.f ) < gray( 500.f ) );
+		REQUIRE( gray( 500.f ) < gray( 1000.f ) );
+	}
+	else
+	{
+		REQUIRE( std::abs( gray( 50.f ) - std::pow( 0.25f, 1.f / 2.2f ) ) < 0.002f );
+		REQUIRE( gray( 500.f ) == 1.f );
 	}
 }
