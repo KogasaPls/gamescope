@@ -13,6 +13,7 @@
 #include "refresh_rate.h"
 #include "waitable.h"
 #include "hdr_metadata_sanitize.hpp"
+#include "hdr_client_offer.hpp"
 #include "Utils/TempFiles.h"
 #include "window_icon.hpp"
 #include "HostXTestInput.hpp"
@@ -50,7 +51,6 @@
 
 extern int g_nPreferredOutputWidth;
 extern int g_nPreferredOutputHeight;
-extern bool g_bForceHDR10OutputDebug;
 extern bool g_bBorderlessOutputWindow;
 extern gamescope::ConVar<bool> cv_adaptive_sync;
 
@@ -830,6 +830,7 @@ namespace gamescope
 
         virtual glm::uvec2 CursorSurfaceSize( glm::uvec2 uvecSize ) const override;
         virtual void HackUpdatePatchedEdid() override;
+        virtual bool HostAcceptsHDR10() const override;
 
         virtual bool UsesVirtualConnectors() override;
         virtual std::shared_ptr<IBackendConnector> CreateVirtualConnector( uint64_t ulVirtualConnectorKey ) override;
@@ -2913,16 +2914,14 @@ namespace gamescope
 
         // XXX: We should do this a better way that handles per-window and appid stuff
         // down the line
-        if ( cv_hdr_enabled && GetCurrentConnector()->GetHDRInfo().bExposeHDRSupport )
-        {
-            setenv( "DXVK_HDR", "1", true );
-        }
-        else
-        {
-            setenv( "DXVK_HDR", "0", true );
-        }
+        setenv( "DXVK_HDR", hdr_offer::CurrentOffer( *this ) ? "1" : "0", true );
 
         WritePatchedEdid( GetCurrentConnector()->GetRawEDID(), GetCurrentConnector()->GetHDRInfo(), false );
+    }
+
+    bool CWaylandBackend::HostAcceptsHDR10() const
+    {
+        return SupportsColorManagement();
     }
 
     bool CWaylandBackend::UsesVirtualConnectors()

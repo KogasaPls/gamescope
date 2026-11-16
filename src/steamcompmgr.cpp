@@ -84,6 +84,7 @@
 #include "wlserver.hpp"
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
+#include "hdr_client_offer.hpp"
 #include "focus_placement.h"
 #include "mangoapp_config.h"
 #include "vblankmanager.hpp"
@@ -1134,7 +1135,29 @@ int 			currentOutputRefresh;
 uint32_t		currentOutputRotation = 0;
 bool			currentHDROutput = false;
 bool			currentHDRCapable = false;
-bool			currentHDRForce = false;
+bool			currentHDROffer = false;
+
+bool gamescope::hdr_offer::CurrentOffer( IBackend &backend )
+{
+	auto *connector = backend.GetCurrentConnector();
+	const bool outputSupportsHDR = connector && connector->SupportsHDR();
+	return OfferHDRToClients( cv_hdr_enabled, outputSupportsHDR || g_bForceHDR10OutputDebug,
+		backend.HostAcceptsHDR10(), g_bForceHDRSupportDebug );
+}
+
+static void set_client_hdr_feedback( xwayland_ctx_t *ctx, bool offer )
+{
+	long value = offer ? 1 : 0;
+	XChangeProperty( ctx->dpy, ctx->root, ctx->atoms.gamescopeHDROutputFeedback,
+		XA_CARDINAL, 32, PropModeReplace, reinterpret_cast<unsigned char *>( &value ), 1 );
+}
+
+// A newly connected WSI client caches this root property on its first surface.
+static void initialize_client_hdr_feedback( xwayland_ctx_t *ctx )
+{
+	set_client_hdr_feedback( ctx, gamescope::hdr_offer::CurrentOffer( *GetBackend() ) );
+	XSync( ctx->dpy, False );
+}
 
 std::vector< uint32_t > vecFocuscontrolAppIDs;
 
@@ -8176,6 +8199,7 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 			assert(server_id != ~0u);
 			gamescope_xwayland_server_t *server = wlserver_get_xwayland_server(server_id);
 			init_xwayland_ctx(server_id, server);
+			initialize_client_hdr_feedback( server->ctx.get() );
 			char propertyString[256];
 			snprintf(propertyString, sizeof(propertyString), "%u %u %s", identifier, server_id, server->get_nested_display_name());
 			XTextProperty text_property =
@@ -10874,13 +10898,6 @@ steamcompmgr_main(int argc, char **argv)
 			determine_and_apply_focus( pFocus );
 	}
 
-	if ( readyPipeFD != -1 )
-	{
-		dprintf( readyPipeFD, "%s %s\n", root_ctx->xwayland_server->get_nested_display_name(), wlserver_get_wl_display_name() );
-		close( readyPipeFD );
-		readyPipeFD = -1;
-	}
-
 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
 	g_SteamCompMgrWaiter.AddWaitable( &g_FPSLimitVRRTimer );
 	GetVBlankTimer().ArmNextVBlank( true );
@@ -10916,6 +10933,16 @@ steamcompmgr_main(int argc, char **argv)
 	update_edid_prop();
 
 	update_screenshot_color_mgmt();
+
+	for ( size_t i = 0; auto *server = wlserver_get_xwayland_server( i ); ++i )
+		initialize_client_hdr_feedback( server->ctx.get() );
+
+	if ( readyPipeFD != -1 )
+	{
+		dprintf( readyPipeFD, "%s %s\n", root_ctx->xwayland_server->get_nested_display_name(), wlserver_get_wl_display_name() );
+		close( readyPipeFD );
+		readyPipeFD = -1;
+	}
 
 	LaunchNestedChildren( subCommandArg >= 0 ? &argv[ subCommandArg ] : nullptr );
 
@@ -11161,6 +11188,7 @@ steamcompmgr_main(int argc, char **argv)
 		// Capability is advertised to clients regardless of the live "active"
 		// state below, so games can request HDR while the panel is idling in SDR.
 		const bool bOutputHDRCapable = (g_bSupportsHDR_CachedValue || g_bForceHDR10OutputDebug) && cv_hdr_enabled;
+		const bool bOfferHDR = gamescope::hdr_offer::CurrentOffer( *GetBackend() );
 
 		{
 			gamescope::IBackendConnector *pConn = GetBackend()->GetCurrentConnector();
@@ -11208,7 +11236,7 @@ steamcompmgr_main(int argc, char **argv)
 			 currentOutputRotation != g_uOutputRotation ||
 			 ( bHDROutputChanged && GetBackend()->UsesVulkanSwapchain() ) ||
 			 currentHDRCapable != bOutputHDRCapable ||
-			 currentHDRForce != g_bForceHDRSupportDebug;
+			 currentHDROffer != bOfferHDR;
 
 		if ( bReconfigureOutput || bHDROutputChanged )
 		{
@@ -11242,9 +11270,7 @@ steamcompmgr_main(int argc, char **argv)
 				gamescope_xwayland_server_t *server = NULL;
 				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
 				{
-					long hdr_value = ( bOutputHDRCapable || g_bForceHDRSupportDebug ) ? 1 : 0;
-					XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeHDROutputFeedback, XA_CARDINAL, 32, PropModeReplace,
-						(unsigned char *)&hdr_value, 1 );
+					set_client_hdr_feedback( server->ctx.get(), bOfferHDR );
 
 					server->ctx->cursor->setDirty();
 
@@ -11265,7 +11291,7 @@ steamcompmgr_main(int argc, char **argv)
 			currentOutputRotation = g_uOutputRotation;
 			currentHDROutput = g_bOutputHDREnabled;
 			currentHDRCapable = bOutputHDRCapable;
-			currentHDRForce = g_bForceHDRSupportDebug;
+			currentHDROffer = bOfferHDR;
 
 #if HAVE_PIPEWIRE
 			nudge_pipewire();
