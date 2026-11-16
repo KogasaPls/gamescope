@@ -84,6 +84,7 @@
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
 #include "hdr_client_offer.hpp"
+#include "capture_tonemap.hpp"
 #include "focus_placement.h"
 #include "mangoapp_config.h"
 #include "vblankmanager.hpp"
@@ -502,6 +503,9 @@ bool g_bSupportsHDR_CachedValue = false;
 bool g_bForceHDR10OutputDebug = false;
 gamescope::ConVar<bool> cv_hdr_enabled{ "hdr_enabled", false, "Whether or not HDR is enabled if it is available." };
 gamescope::ConVar<bool> cv_hdr_content_driven{ "hdr_content_driven", false, "Only drive a panel in HDR while an HDR app is running." };
+gamescope::ConVar<float> cv_capture_sdr_white_nits{ "capture_sdr_white_nits", 500.f, "Luminance in nits of HDR content that SDR screenshots and PipeWire capture show as white." };
+gamescope::ConVar<float> cv_capture_hdr_peak_nits{ "capture_hdr_peak_nits", 0.f, "Peak luminance in nits of HDR content for SDR screenshots and PipeWire capture. Above capture_sdr_white_nits, highlights roll off with the BT.2390 EETF instead of clipping." };
+gamescope::ConVar<int> cv_capture_tonemap_operator{ "capture_tonemap_operator", 3, "BT.2390 EETF variant for capture_hdr_peak_nits: 1 luma, 2 independent, 3 max channel." };
 bool g_bHDRItmEnable = false;
 int g_nCurrentRefreshRate_CachedValue = 0;
 
@@ -692,11 +696,42 @@ update_color_mgmt()
 	g_ColorMgmt.current = g_ColorMgmt.pending;
 }
 
+static gamescope::capture_tonemap::CaptureTonemap s_ScreenshotCaptureTonemap;
+
+static gamescope::capture_tonemap::CaptureTonemap
+current_capture_tonemap()
+{
+	return gamescope::capture_tonemap::Resolve( cv_capture_sdr_white_nits, cv_capture_hdr_peak_nits, cv_capture_tonemap_operator );
+}
+
+static void
+create_screenshot_sdr_luts( const gamescope::capture_tonemap::CaptureTonemap &tonemap )
+{
+	gamescope_color_mgmt_t colorMgmt = k_ScreenshotColorMgmt;
+	colorMgmt.flInternalDisplayBrightness = tonemap.flSDRWhiteNits;
+	if ( tonemap.bRollOff )
+	{
+		colorMgmt.hdrTonemapOperator = static_cast<ETonemapOperator>( tonemap.nOperator );
+		colorMgmt.hdrTonemapSourceMetadata = { .flBlackPointNits = 0.f, .flWhitePointNits = tonemap.flSourcePeakNits };
+		colorMgmt.hdrTonemapDisplayMetadata = { .flBlackPointNits = 0.f, .flWhitePointNits = tonemap.flSDRWhiteNits };
+	}
+	create_color_mgmt_luts( colorMgmt, g_ScreenshotColorMgmtLuts );
+	s_ScreenshotCaptureTonemap = tonemap;
+}
+
 static void
 update_screenshot_color_mgmt()
 {
-	create_color_mgmt_luts(k_ScreenshotColorMgmt, g_ScreenshotColorMgmtLuts);
+	create_screenshot_sdr_luts( current_capture_tonemap() );
 	create_color_mgmt_luts(k_ScreenshotColorMgmtHDR, g_ScreenshotColorMgmtLutsHDR);
+}
+
+static void
+update_screenshot_sdr_luts_if_changed()
+{
+	const gamescope::capture_tonemap::CaptureTonemap tonemap = current_capture_tonemap();
+	if ( tonemap != s_ScreenshotCaptureTonemap )
+		create_screenshot_sdr_luts( tonemap );
 }
 
 bool set_color_sdr_gamut_wideness( float flVal )
@@ -11690,6 +11725,8 @@ steamcompmgr_main(int argc, char **argv)
 			// so we don't stop vblanking forever.
 			GetVBlankTimer().ArmNextVBlank( true );
 		}
+
+		update_screenshot_sdr_luts_if_changed();
 
 #if HAVE_PIPEWIRE
 		// The stream is sized to the part of the output the backend shows.
