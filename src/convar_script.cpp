@@ -72,6 +72,8 @@ namespace gamescope
     REGISTER_CONVAR_TYPE( VirtualConnectorStrategy )
     REGISTER_CONVAR_TYPE( TouchClickMode )
     REGISTER_ATOMIC_CONVAR_TYPE( bool )
+    REGISTER_ATOMIC_CONVAR_TYPE( float )
+    REGISTER_ATOMIC_CONVAR_TYPE( int )
 }
 
 #endif

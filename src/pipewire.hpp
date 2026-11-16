@@ -83,6 +83,7 @@ uint32_t get_pipewire_stream_node_id(void);
 struct pipewire_buffer *dequeue_pipewire_buffer(void);
 bool pipewire_is_streaming();
 uint64_t pipewire_focus_appid();
+void pipewire_invalidate_capture();
 uint64_t pipewire_capture_generation();
 bool pipewire_capture_frame_due(int nRefreshmHz);
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer);

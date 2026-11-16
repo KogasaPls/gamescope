@@ -86,6 +86,7 @@
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
 #include "hdr_client_offer.hpp"
+#include "capture_tonemap_settings.hpp"
 #include "focus_placement.h"
 #include "mangoapp_config.h"
 #include "vblankmanager.hpp"
@@ -706,11 +707,41 @@ update_color_mgmt()
 	g_ColorMgmt.current = g_ColorMgmt.pending;
 }
 
+static gamescope::capture_tonemap::CaptureTonemap s_ScreenshotCaptureTonemap;
+
+static void
+create_screenshot_sdr_luts( const gamescope::capture_tonemap::CaptureTonemap &tonemap )
+{
+	gamescope_color_mgmt_t colorMgmt = k_ScreenshotColorMgmt;
+	colorMgmt.flInternalDisplayBrightness = tonemap.flSDRWhiteNits;
+	if ( tonemap.bRollOff )
+	{
+		colorMgmt.hdrTonemapOperator = static_cast<ETonemapOperator>( tonemap.nOperator );
+		colorMgmt.hdrTonemapSourceMetadata = { .flBlackPointNits = 0.f, .flWhitePointNits = tonemap.flSourcePeakNits };
+		colorMgmt.hdrTonemapDisplayMetadata = { .flBlackPointNits = 0.f, .flWhitePointNits = tonemap.flSDRWhiteNits };
+	}
+	create_color_mgmt_luts( colorMgmt, g_ScreenshotColorMgmtLuts );
+	s_ScreenshotCaptureTonemap = tonemap;
+}
+
 static void
 update_screenshot_color_mgmt()
 {
-	create_color_mgmt_luts(k_ScreenshotColorMgmt, g_ScreenshotColorMgmtLuts);
+	create_screenshot_sdr_luts( gamescope::capture_tonemap::CurrentSettings() );
 	create_color_mgmt_luts(k_ScreenshotColorMgmtHDR, g_ScreenshotColorMgmtLutsHDR);
+}
+
+static void
+update_screenshot_sdr_luts_if_changed()
+{
+	const gamescope::capture_tonemap::CaptureTonemap tonemap = gamescope::capture_tonemap::CurrentSettings();
+	if ( tonemap == s_ScreenshotCaptureTonemap )
+		return;
+
+	create_screenshot_sdr_luts( tonemap );
+#if HAVE_PIPEWIRE
+	pipewire_invalidate_capture();
+#endif
 }
 
 bool set_color_sdr_gamut_wideness( float flVal )
@@ -11804,6 +11835,8 @@ steamcompmgr_main(int argc, char **argv)
 			// so we don't stop vblanking forever.
 			GetVBlankTimer().ArmNextVBlank( true );
 		}
+
+		update_screenshot_sdr_luts_if_changed();
 
 #if HAVE_PIPEWIRE
 		const uint64_t ulCaptureAppId = pipewire_focus_appid();
