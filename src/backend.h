@@ -382,6 +382,10 @@ namespace gamescope
         virtual bool SupportsPlaneHardwareCursor() const = 0;
         virtual bool SupportsTearing() const = 0;
 
+        // Whether a nested host takes HDR10 PQ surfaces from us, whatever its
+        // current preferred image description says.
+        virtual bool HostAcceptsHDR10() const { return false; }
+
         virtual bool UsesVulkanSwapchain() const = 0;
         virtual bool IsSessionBased() const = 0;
 
