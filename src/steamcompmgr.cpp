@@ -84,6 +84,7 @@
 #include "wlserver.hpp"
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
+#include "hdr_client_offer.hpp"
 #include "focus_placement.h"
 #include "mangoapp_config.h"
 #include "vblankmanager.hpp"
@@ -1124,7 +1125,7 @@ int 			currentOutputRefresh;
 uint32_t		currentOutputRotation = 0;
 bool			currentHDROutput = false;
 bool			currentHDRCapable = false;
-bool			currentHDRForce = false;
+bool			currentHDROffer = false;
 
 std::vector< uint32_t > vecFocuscontrolAppIDs;
 
@@ -11193,6 +11194,8 @@ steamcompmgr_main(int argc, char **argv)
 		// Capability is advertised to clients regardless of the live "active"
 		// state below, so games can request HDR while the panel is idling in SDR.
 		const bool bOutputHDRCapable = (g_bSupportsHDR_CachedValue || g_bForceHDR10OutputDebug) && cv_hdr_enabled;
+		const bool bOfferHDR = gamescope::hdr_offer::OfferHDRToClients( cv_hdr_enabled, bOutputHDRCapable,
+			GetBackend()->HostAcceptsHDR10(), g_bForceHDRSupportDebug );
 
 		{
 			gamescope::IBackendConnector *pConn = GetBackend()->GetCurrentConnector();
@@ -11240,7 +11243,7 @@ steamcompmgr_main(int argc, char **argv)
 			 currentOutputRotation != g_uOutputRotation ||
 			 ( bHDROutputChanged && GetBackend()->UsesVulkanSwapchain() ) ||
 			 currentHDRCapable != bOutputHDRCapable ||
-			 currentHDRForce != g_bForceHDRSupportDebug;
+			 currentHDROffer != bOfferHDR;
 
 		if ( bReconfigureOutput || bHDROutputChanged )
 		{
@@ -11274,7 +11277,7 @@ steamcompmgr_main(int argc, char **argv)
 				gamescope_xwayland_server_t *server = NULL;
 				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
 				{
-					long hdr_value = ( bOutputHDRCapable || g_bForceHDRSupportDebug ) ? 1 : 0;
+					long hdr_value = bOfferHDR ? 1 : 0;
 					XChangeProperty(server->ctx->dpy, server->ctx->root, server->ctx->atoms.gamescopeHDROutputFeedback, XA_CARDINAL, 32, PropModeReplace,
 						(unsigned char *)&hdr_value, 1 );
 
@@ -11297,7 +11300,7 @@ steamcompmgr_main(int argc, char **argv)
 			currentOutputRotation = g_uOutputRotation;
 			currentHDROutput = g_bOutputHDREnabled;
 			currentHDRCapable = bOutputHDRCapable;
-			currentHDRForce = g_bForceHDRSupportDebug;
+			currentHDROffer = bOfferHDR;
 
 #if HAVE_PIPEWIRE
 			nudge_pipewire();
