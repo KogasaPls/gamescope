@@ -221,6 +221,12 @@ namespace gamescope
 			return false;
 		}
 
+		virtual bool HostAcceptsHDR10() const override
+		{
+			std::shared_lock lock{ m_mutInit };
+			return m_bInittedChild && m_pChild->HostAcceptsHDR10();
+		}
+
 		virtual bool UsesVulkanSwapchain() const override
 		{
             // Doesn't need to be 'initted' for this check.
