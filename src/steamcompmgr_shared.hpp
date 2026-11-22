@@ -156,6 +156,7 @@ struct steamcompmgr_win_t {
 	bool outdatedInteractiveFocus = false;
 
 	uint64_t last_commit_first_latch_time = 0;
+	uint64_t last_fifo_latch_time = 0;
 	uint64_t last_commit_present_time = 0;
 	uint64_t presentation_sequence = 0;
 

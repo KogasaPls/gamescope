@@ -86,6 +86,7 @@
 #include "focus_placement.h"
 #include "mangoapp_config.h"
 #include "vblankmanager.hpp"
+#include "vrr_fifo_latch.hpp"
 #include "log.hpp"
 #include "Utils/Defer.h"
 #include "win32_styles.h"
@@ -7039,6 +7040,20 @@ steamcompmgr_flush_frame_done( steamcompmgr_win_t *w )
 
 static std::optional<uint64_t> s_oLowestFPSLimitScheduleVRR;
 
+static bool steamcompmgr_vrr_holds_fifo_latch( steamcompmgr_win_t *w, uint64_t now )
+{
+	if ( !GetBackend()->GetCurrentConnector() || !GetBackend()->GetCurrentConnector()->IsVRRActive() )
+		return false;
+
+	const auto oWake = gamescope::VRRFifoLatchWait( now, w->last_fifo_latch_time, g_SteamCompMgrAppRefreshCycle, k_ulVRRScheduleFudge );
+	if ( !oWake )
+		return false;
+
+	if ( !s_oLowestFPSLimitScheduleVRR || *oWake < *s_oLowestFPSLimitScheduleVRR )
+		s_oLowestFPSLimitScheduleVRR = oWake;
+	return true;
+}
+
 // Display vblank index of the previous vblank pass. The limiter opens when a pass crosses a divisor boundary.
 static uint64_t s_ulPrevVBlankIdx = 0;
 
@@ -8333,7 +8348,7 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 		// Only pace windows the FPS limiter covers.
 		const bool entry_vblank = vblank && steamcompmgr_should_vblank_window( entry_win, vblank_idx, now );
 
-		if (entry.fifo && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0))
+		if (entry.fifo && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0 || steamcompmgr_vrr_holds_fifo_latch( entry_win, now )))
 		{
 			commits_before_their_time.push_back( entry );
 			continue;
@@ -8343,7 +8358,10 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 		if ( result == gamescope::CommitQueue::SelectionResult::Blocked )
 			commits_before_their_time.push_back( entry );
 		else if ( result == gamescope::CommitQueue::SelectionResult::Ready && entry.fifo )
+		{
 			fifo_win_seqs.insert(entry.winSeq);
+			entry_win->last_fifo_latch_time = gamescope::VRRFifoLatchTime( now, entry_win->last_fifo_latch_time, g_SteamCompMgrAppRefreshCycle, k_ulVRRScheduleFudge );
+		}
 	}
 
 	ctx->doneCommits->listCommitsDone.swap( commits_before_their_time );
@@ -8384,7 +8402,7 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 		// Only pace windows the FPS limiter covers.
 		const bool entry_vblank = vblank && steamcompmgr_should_vblank_window( entry_win, vblank_idx, now );
 
-		if (entry.fifo && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0))
+		if (entry.fifo && (!entry_vblank || fifo_win_seqs.count(entry.winSeq) > 0 || steamcompmgr_vrr_holds_fifo_latch( entry_win, now )))
 		{
 			commits_before_their_time.push_back( entry );
 			continue;
@@ -8394,7 +8412,10 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 		if ( result == gamescope::CommitQueue::SelectionResult::Blocked )
 			commits_before_their_time.push_back( entry );
 		else if ( result == gamescope::CommitQueue::SelectionResult::Ready && entry.fifo )
+		{
 			fifo_win_seqs.insert(entry.winSeq);
+			entry_win->last_fifo_latch_time = gamescope::VRRFifoLatchTime( now, entry_win->last_fifo_latch_time, g_SteamCompMgrAppRefreshCycle, k_ulVRRScheduleFudge );
+		}
 	}
 
 	g_steamcompmgr_xdg_done_commits->listCommitsDone.swap( commits_before_their_time );
